@@ -69,8 +69,8 @@ def chatbot_page():
             if not top_chunks:
                 response = "No relevant chunks found in the database."
             else:
-                # response = handle_query(user_query, top_chunks)
-                response = top_chunks
+                response = handle_query(user_query, top_chunks)
+                # response = top_chunks
 
             runtime_ms = (time.time() - start_time) * 1000
             with st.chat_message("assistant"):
