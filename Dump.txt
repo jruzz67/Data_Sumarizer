@@ -1,0 +1,34 @@
+Create Virtual Environment
+python -m venv venv
+Activate the Environment.
+venv\Scripts\activate
+
+uvicorn main:app --reload
+
+Build & Install pgvector on Windows for PostgreSQL 17
+1. Prepare Environment
+Open Visual Studio Developer Command Prompt (x64) by running:
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+
+Set PostgreSQL root directory environment variable:
+set "PGROOT=C:\Program Files\PostgreSQL\17"
+
+2. Clone pgvector Repository
+Clone the specific version branch v0.7.4:
+git clone --branch v0.7.4 https://github.com/pgvector/pgvector.git
+cd pgvector
+
+3. Build the Extension
+Run the build command using nmake and the provided Windows Makefile:
+nmake /F Makefile.win
+
+4. Install the Extension
+Run the install command (must have write permission for PostgreSQL folders):
+nmake /F Makefile.win install
+This copies the built DLL and extension files into PostgreSQL directories.
+
+5. Finalize
+Restart your PostgreSQL server to ensure it picks up the new extension.
+Connect to your database using psql or another client.
+Enable the extension in your database:
+CREATE EXTENSION vector;

@@ -1,0 +1,25 @@
+Python virtual environment
+venv/
+
+Log files
+app.log
+
+Environment variables
+.env
+
+Temporary files
+*.pyc
+pycache/
+*.pyo
+*.pyd
+
+Database files
+*.db
+
+OS generated files
+.DS_Store
+Thumbs.db
+
+Editor files
+.vscode/
+.idea/
