@@ -1,9 +1,7 @@
 import os
 import logging
 from typing import List
-from dotenv import load_dotenv
-import google.generativeai as genai
-from tenacity import retry, stop_after_attempt, wait_exponential
+import ollama
 
 # Configure logging
 logging.basicConfig(
@@ -16,18 +14,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# Test connection to Ollama and nomic-embed-text model
+logger.info("Testing connection to nomic-embed-text via Ollama...")
+try:
+    test_input = "Test input for embedding model."
+    test_embedding = ollama.embeddings(model="nomic-embed-text", prompt=test_input)
+    logger.info(f"Test embedding successful: {len(test_embedding['embedding'])} dimensions")
+except Exception as e:
+    logger.error(f"Failed to connect to nomic-embed-text via Ollama: {str(e)}")
+    raise
+logger.info("Ollama connection and nomic-embed-text model verified.")
 
-# Initialize Gemini API
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-if not gemini_api_key:
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
-genai.configure(api_key=gemini_api_key)
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def embed_chunks(chunks: List[str]) -> List[List[float]]:
     """
-    Generate embeddings for a list of text chunks using Gemini's text-embedding-004 model.
+    Generate embeddings for a list of text chunks using nomic-embed-text via Ollama.
     
     Args:
         chunks (List[str]): List of text chunks to embed.
@@ -42,14 +42,10 @@ def embed_chunks(chunks: List[str]) -> List[List[float]]:
         logger.info(f"Generating embeddings for {len(chunks)} chunks")
         embeddings = []
         
-        # Gemini API doesn't support batch embedding in a single call, so we process chunks individually
+        # Process chunks in a batch for efficiency
         for chunk in chunks:
-            result = genai.embed_content(
-                model="models/text-embedding-004",
-                content=chunk,
-                task_type="retrieval_document"
-            )
-            embedding = result["embedding"]
+            response = ollama.embeddings(model="nomic-embed-text", prompt=chunk)
+            embedding = response["embedding"]
             embeddings.append(embedding)
             logger.info(f"Processed chunk {len(embeddings)} of {len(chunks)}")
 
