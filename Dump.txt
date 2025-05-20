@@ -1,3 +1,11 @@
+uvicorn main:app --host 0.0.0.0 --port 8000
+
+set "PATH=%PATH%;C:\Users\ASUS\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-7.1.1-full_build\bin"
+set "PATH=%PATH%;C:\Program Files\eSpeak NG"
+
+eSpeak-NG --version
+ffmpeg --version
+
 Create Virtual Environment
 python -m venv venv
 Activate the Environment.
@@ -32,3 +40,44 @@ Restart your PostgreSQL server to ensure it picks up the new extension.
 Connect to your database using psql or another client.
 Enable the extension in your database:
 CREATE EXTENSION vector;
+
+
+
+Speech-to-Text (STT) and Text-to-Speech (TTS) Implementation in QuerySQL
+Setup
+Environment Preparation:
+Set up a Python virtual environment and installed required dependencies: fastapi, uvicorn, pydub, vosk, coqui-tts, psycopg2, and python-multipart.
+Ensured ffmpeg was installed and added to the system PATH (C:\Users\ASUS\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-7.1.1-full_build\bin) to enable audio conversion with pydub.
+Added espeak-ng to PATH (C:\Program Files\eSpeak NG) for TTS model support.
+Directories:
+Created uploads/ for temporary audio files and audio/ for storing generated TTS audio responses.
+TTS models stored in C:/Users/ASUS/AppData/Local/tts.
+Vosk Model for STT:
+Used the Vosk model vosk-model-small-en-us-0.15 for STT, loaded from models/vosk-model-small-en-us-0.15/.
+TTS Model Setup:
+Simplified to two Coqui TTS models:
+female: tts_models/en/ljspeech/tacotron2-DDC (no speaker).
+male: tts_models/en/vctk/vits with speaker p239 (male voice).
+Cleaned up unused models (tts_models/en/jenny/jenny, tts_models/en/ljspeech/glow-tts, etc.) to optimize storage.
+STT Implementation
+Frontend (Chatbot.jsx):
+Captured audio via browser’s MediaRecorder API (audio/webm;codecs=opus).
+Sent the recorded .webm audio to the backend via a POST request to /transcribe.
+Backend (main.py):
+/transcribe endpoint received the .webm file, converted it to .wav (mono, 16-bit, 16 kHz) using pydub and ffmpeg.
+Used Vosk’s KaldiRecognizer to transcribe the .wav audio into text.
+Returned the transcribed text to the frontend, which was then used as a query.
+TTS Implementation
+Backend (main.py):
+/query endpoint processed the user query, generated a response, and converted it to speech using the selected TTS model (female or male).
+text_to_speech function used Coqui TTS to generate .wav audio, saved in audio/, and returned an audio URL.
+Cleaned up old audio files periodically.
+Frontend (Chatbot.jsx):
+Displayed the response with a play button to stream the generated audio via the /audio/{filename} endpoint.
+Final Models
+STT Model: vosk-model-small-en-us-0.15 (lightweight, English, offline transcription).
+TTS Models:
+female: tts_models/en/ljspeech/tacotron2-DDC (stable, clear female voice).
+male: tts_models/en/vctk/vits with speaker p239 (reliable male voice, handles symbols well).
+Outcome
+The STT system accurately transcribes user speech into text queries, while the TTS system provides clear male and female voice responses, with improved stability after removing problematic models.

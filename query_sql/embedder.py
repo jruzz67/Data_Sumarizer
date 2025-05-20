@@ -2,8 +2,9 @@ import os
 import logging
 from typing import List
 from dotenv import load_dotenv
-import google.generativeai as genai
+import ollama
 from tenacity import retry, stop_after_attempt, wait_exponential
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configure logging
 logging.basicConfig(
@@ -18,19 +19,37 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Initialize Gemini API
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-if not gemini_api_key:
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
-genai.configure(api_key=gemini_api_key)
-
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def embed_chunks(chunks: List[str]) -> List[List[float]]:
+def embed_single_chunk(chunk: str) -> List[float]:
     """
-    Generate embeddings for a list of text chunks using Gemini's text-embedding-004 model.
+    Generate embedding for a single text chunk using Ollama's nomic-embed-text model.
+    
+    Args:
+        chunk (str): Text chunk to embed.
+    
+    Returns:
+        List[float]: Embedding vector (768-dimensional).
+    """
+    try:
+        response = ollama.embeddings(
+            model="nomic-embed-text:latest",
+            prompt=chunk
+        )
+        embedding = response["embedding"]
+        if len(embedding) != 768:
+            raise ValueeError(f"Unexpected embedding dimension: {len(embedding)} (expected 768)")
+        return embedding
+    except Exception as e:
+        logger.error(f"Error generating embedding for chunk: {str(e)}")
+        raise
+
+def embed_chunks(chunks: List[str], max_workers: int = 4) -> List[List[float]]:
+    """
+    Generate embeddings for a list of text chunks using Ollama's nomic-embed-text model in parallel.
     
     Args:
         chunks (List[str]): List of text chunks to embed.
+        max_workers (int): Maximum number of concurrent workers.
     
     Returns:
         List[List[float]]: List of embeddings, each a 768-dimensional vector.
@@ -40,28 +59,30 @@ def embed_chunks(chunks: List[str]) -> List[List[float]]:
 
     try:
         logger.info(f"Generating embeddings for {len(chunks)} chunks")
-        embeddings = []
+        embeddings = [None] * len(chunks)  # Pre-allocate list to maintain order
         
-        # Gemini API doesn't support batch embedding in a single call, so we process chunks individually
-        for chunk in chunks:
-            result = genai.embed_content(
-                model="models/text-embedding-004",
-                content=chunk,
-                task_type="retrieval_document"
-            )
-            embedding = result["embedding"]
-            embeddings.append(embedding)
-            logger.info(f"Processed chunk {len(embeddings)} of {len(chunks)}")
-
-        # Verify embedding dimensions
-        for emb in embeddings:
-            if len(emb) != 768:
-                raise ValueError(f"Unexpected embedding dimension: {len(emb)} (expected 768)")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Create a future for each chunk
+            future_to_index = {
+                executor.submit(embed_single_chunk, chunk): idx
+                for idx, chunk in enumerate(chunks)
+            }
+            
+            # Process completed futures
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    embedding = future.result()
+                    embeddings[idx] = embedding
+                    logger.info(f"Processed chunk {idx + 1} of {len(chunks)}")
+                except Exception as e:
+                    logger.error(f"Failed to process chunk {idx + 1}: {str(e)}")
+                    raise
 
         logger.info("Embeddings generated successfully")
         return embeddings
     except Exception as e:
-        logger.error(f"Error generating embeddings: {str(e)}")
+        logger.error(f"Error generating embeddings with Ollama: {str(e)}")
         raise
 
 def store_embeddings(chunks: List[str], embeddings: List[List[float]], document_name: str, conn):
