@@ -1,0 +1,82 @@
+.chatbot {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-height: calc(100vh - 200px);
+}
+
+.chat-window {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid #333;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  margin-bottom: 10px;
+}
+
+.message {
+  margin: 5px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  max-width: 80%;
+  word-wrap: break-word;
+}
+
+.message.user {
+  background: #007bff;
+  color: white;
+  align-self: flex-start;
+}
+
+.message.bot {
+  background: #444;
+  color: white;
+  align-self: flex-start;
+}
+
+.message.error {
+  background: #ff4444;
+  color: white;
+  align-self: flex-start;
+}
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+button {
+  padding: 10px 20px;
+  font-size: 16px;
+  background-color: #007bff;
+  color: white;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background-color 0.3s;
+}
+
+button:hover {
+  background-color: #0056b3;
+}
+
+button:disabled {
+  background-color: #666;
+  cursor: not-allowed;
+}
+
+button.recording {
+  background-color: #ff4444;
+}
+
+button.recording:hover {
+  background-color: #cc0000;
+}
+
+.status {
+  font-size: 14px;
+  color: #aaa;
+}

@@ -1,373 +1,383 @@
-import { useState, useEffect, useRef } from 'react';
-import { FaMicrophone, FaPaperPlane, FaStopCircle, FaSpinner, FaPlayCircle, FaPauseCircle } from 'react-icons/fa';
-import axios from 'axios';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useRef } from "react";
+import { motion } from "framer-motion";
+import "./Chatbot.css";
 
-const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
+function Chatbot({ voiceModel, websocket, isConnected, onDisconnect }) {
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
   const [isRecording, setIsRecording] = useState(false);
-  const [mediaRecorder, setMediaRecorder] = useState(null);
-  const chatEndRef = useRef(null);
-  const [isSending, setIsSending] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [isBotTyping, setIsBotTyping] = useState(false);
-  const [currentAudio, setCurrentAudio] = useState(null);
-  const [playingMessageId, setPlayingMessageId] = useState(null);
-  const [isPlaying, setIsPlaying] = useState(false);
+  const [status, setStatus] = useState("Idle");
+  const [error, setError] = useState(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const processorRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const userAudioChunksRef = useRef([]);
+  const silenceCheckIntervalRef = useRef(null);
+  const chunkIntervalRef = useRef(null);
+  const isProcessingRef = useRef(false);
+  const pcmBufferRef = useRef([]); // Buffer to store PCM data for 1-second chunks
+  const sessionIdRef = useRef(0); // Track session for new speech detection
+
+  const SILENCE_THRESHOLD = 0.03;
+  const SILENCE_DURATION = 2000; // Fixed 2-second silence duration
+  const SAMPLE_RATE = 16000;
+  const CHUNK_DURATION_MS = 1000; // 1-second chunks
+  const SAMPLES_PER_CHUNK = SAMPLE_RATE * (CHUNK_DURATION_MS / 1000);
+
+  const addMessage = (newMessage) => {
+    setMessages((prevMessages) => {
+      const updatedMessages = [...prevMessages, newMessage];
+      if (updatedMessages.length > 2) {
+        return updatedMessages.slice(-2);
+      }
+      return updatedMessages;
+    });
+  };
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, 100);
-    return () => clearTimeout(timer);
-  }, [messages]);
+    audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: SAMPLE_RATE,
+    });
 
-  useEffect(() => {
     return () => {
-      if (currentAudio) {
-        currentAudio.pause();
-        currentAudio.currentTime = 0;
-        setCurrentAudio(null);
-        setPlayingMessageId(null);
-        setIsPlaying(false);
+      if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+        audioContextRef.current.close();
       }
     };
-  }, [currentAudio]);
+  }, []);
 
-  const stopCurrentAudio = () => {
-    if (currentAudio) {
-      currentAudio.pause();
-      currentAudio.currentTime = 0;
-      setCurrentAudio(null);
-      setPlayingMessageId(null);
-      setIsPlaying(false);
-    }
-  };
-
-  const handleSendMessage = async (queryText) => {
-    if (!queryText.trim() || isSending) return;
-
-    setIsSending(true);
-    const userMessage = { role: 'user', content: queryText };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
-    setIsBotTyping(true);
-
-    try {
-      console.log('Sending query with voice model:', voiceModel);
-      const response = await axios.post('http://localhost:8000/query', { query: queryText, voice_model: voiceModel });
-      const botContent = response.data?.response || 'No response content received.';
-      const audioUrl = response.data?.audio_url;
-
-      const botMessage = { role: 'assistant', content: botContent, audioUrl };
-      setMessages((prev) => [...prev, botMessage]);
-    } catch (error) {
-      console.error('Error sending message:', error);
-      const errorMessage = {
-        role: 'assistant',
-        content: 'Error: ' + (error.response?.data?.detail || error.message || 'An unexpected error occurred.'),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
-    } finally {
-      setIsSending(false);
-      setIsBotTyping(false);
-    }
-  };
-
-  const handlePlayAudio = (audioUrl, messageId) => {
-    if (!audioUrl) return;
-
-    const fullAudioUrl = audioUrl.startsWith('http') ? audioUrl : `http://localhost:8000${audioUrl}`;
-    console.log('Handling audio for:', fullAudioUrl);
-
-    if (playingMessageId === messageId && currentAudio) {
-      if (isPlaying) {
-        currentAudio.pause();
-        setIsPlaying(false);
-      } else {
-        currentAudio.play().catch((e) => {
-          console.error('Audio playback failed:', e);
-          setMessages((prev) => [
-            ...prev,
-            { role: 'assistant', content: 'Error playing audio: ' + e.message },
-          ]);
-        });
-        setIsPlaying(true);
-      }
+  useEffect(() => {
+    if (!websocket) {
+      console.warn("WebSocket is null, cannot set up event listeners");
       return;
     }
 
-    stopCurrentAudio();
+    websocket.onmessage = async (event) => {
+      if (typeof event.data === "string") {
+        const data = JSON.parse(event.data);
+        if (data.type === "transcription") {
+          console.log("Received transcription:", data.text);
+          addMessage({ type: "user", text: data.text });
+          setStatus("Idle");
+          setError(null);
+          isProcessingRef.current = false;
+        } else if (data.type === "response") {
+          console.log("Received bot response:", data.text);
+          addMessage({ type: "bot", text: data.text });
+          setError(null);
+        } else if (data.type === "status") {
+          console.log("Received status message:", data.message);
+          if (data.message === "TTS paused" || data.message === "Bot interrupted") {
+            setStatus("Listening");
+            isPlayingRef.current = false;
+            audioQueueRef.current = [];
+          } else if (data.message === "Ready to receive audio") {
+            setStatus("Listening");
+          }
+        } else if (data.type === "error") {
+          console.error("WebSocket error:", data.message);
+          setError(data.message);
+          setStatus("Idle");
+          setIsRecording(false);
+          isProcessingRef.current = false;
+        }
+      } else {
+        setStatus("Speaking");
+        setError(null);
+        const audioBlob = event.data;
+        try {
+          const arrayBuffer = await audioBlob.arrayBuffer();
+          const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
+          audioQueueRef.current.push(audioBuffer);
 
-    const audio = new Audio(fullAudioUrl);
-    setCurrentAudio(audio);
-    setPlayingMessageId(messageId);
-    setIsPlaying(true);
+          const playNext = async () => {
+            if (audioQueueRef.current.length === 0 || !isPlayingRef.current) {
+              setStatus(isRecording ? "Listening" : "Idle");
+              isPlayingRef.current = false;
+              return;
+            }
+            const buffer = audioQueueRef.current.shift();
+            const source = audioContextRef.current.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContextRef.current.destination);
+            source.onended = () => {
+              playNext();
+            };
+            source.start();
+          };
 
-    audio.oncanplay = () => {
-      console.log('Audio is ready to play');
-      audio.play().catch((e) => {
-        console.error('Audio playback failed:', e);
-        setMessages((prev) => [
-          ...prev,
-          { role: 'assistant', content: 'Error playing audio: ' + e.message },
-        ]);
-        setCurrentAudio(null);
-        setPlayingMessageId(null);
-        setIsPlaying(false);
+          if (!isPlayingRef.current) {
+            isPlayingRef.current = true;
+            playNext();
+          }
+        } catch (e) {
+          console.error("Error playing audio:", e);
+          setError("Failed to play bot response");
+          isPlayingRef.current = false;
+          audioQueueRef.current = [];
+        }
+      }
+    };
+
+    websocket.onclose = () => {
+      console.log("WebSocket closed, attempting to reconnect...");
+      onDisconnect();
+      setIsRecording(false);
+      setStatus("Idle");
+    };
+
+    return () => {
+      websocket.onmessage = null;
+      websocket.onclose = null;
+    };
+  }, [websocket, isRecording, onDisconnect]);
+
+  const sendAudioChunks = () => {
+    if (websocket && websocket.readyState === WebSocket.OPEN && userAudioChunksRef.current.length > 0) {
+      console.log(`Sending ${userAudioChunksRef.current.length} PCM chunks to backend`);
+      userAudioChunksRef.current.forEach((chunk, index) => {
+        console.log(`Chunk ${index} size: ${chunk.byteLength} bytes`);
+        websocket.send(chunk);
       });
-    };
-
-    audio.onended = () => {
-      setCurrentAudio(null);
-      setPlayingMessageId(null);
-      setIsPlaying(false);
-    };
-
-    audio.onerror = (e) => {
-      console.error('Audio loading error:', e);
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: 'Error loading audio: ' + e.message },
-      ]);
-      setCurrentAudio(null);
-      setPlayingMessageId(null);
-      setIsPlaying(false);
-    };
-
-    audio.load();
+      websocket.send(JSON.stringify({ type: "speech_end" }));
+      setStatus("Processing...");
+      isProcessingRef.current = true;
+    } else {
+      console.warn("Cannot send chunks: WebSocket not open or no chunks available");
+      if (!websocket) {
+        setError("WebSocket connection is not available");
+      } else if (websocket.readyState !== WebSocket.OPEN) {
+        setError(`WebSocket is not open (state: ${websocket.readyState})`);
+      } else {
+        setError("No audio chunks to send");
+      }
+    }
+    userAudioChunksRef.current = [];
   };
 
-  const handleRecord = async () => {
-    stopCurrentAudio();
+  const toggleRecording = async () => {
+    if (!isConnected || !websocket) {
+      console.warn("Cannot toggle recording: WebSocket is not connected or websocket is null");
+      setError("WebSocket is not connected. Please try again later.");
+      return;
+    }
 
     if (!isRecording) {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const options = { mimeType: 'audio/webm;codecs=opus' };
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-          options.mimeType = 'audio/webm';
-          if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            console.error('No supported audio MIME type found for MediaRecorder.');
-            setMessages((prev) => [...prev, { role: 'assistant', content: 'Error: Your browser does not support audio recording.' }]);
-            return;
-          }
-        }
-        console.log('Using MIME type:', options.mimeType);
-
-        const recorder = new MediaRecorder(stream, options);
-        const chunks = [];
-
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) {
-            chunks.push(e.data);
-            console.log('Chunk received:', e.data.size);
-          }
-        };
-
-        recorder.onstop = async () => {
-          console.log('Recording stopped, total chunks size:', chunks.reduce((acc, chunk) => acc + chunk.size, 0));
-          setIsRecording(false);
-          setIsTranscribing(true);
-
-          if (chunks.length === 0 || chunks.reduce((acc, chunk) => acc + chunk.size, 0) === 0) {
-            setMessages((prev) => [...prev, { role: 'assistant', content: 'Error: No valid audio data recorded.' }]);
-            setIsTranscribing(false);
-            return;
-          }
-
-          const audioBlob = new Blob(chunks, { type: options.mimeType });
-          console.log('Audio Blob:', audioBlob, 'Size:', audioBlob.size);
-
-          const formData = new FormData();
-          formData.append('file', audioBlob, 'recording.webm');
-
-          try {
-            const response = await axios.post('http://localhost:8000/transcribe', formData);
-            const transcribedText = response.data?.transcribed_text;
-
-            if (!transcribedText) {
-              setMessages((prev) => [...prev, { role: 'assistant', content: 'Transcription failed: Received empty text.' }]);
-              return;
-            }
-
-            setInput(transcribedText);
-            handleSendMessage(transcribedText);
-          } catch (error) {
-            console.error('Error transcribing audio:', error);
-            setMessages((prev) => [
-              ...prev,
-              { role: 'assistant', content: 'Error transcribing audio: ' + (error.response?.data?.detail || error.message || 'An unexpected error occurred.') },
-            ]);
-          } finally {
-            setIsTranscribing(false);
-          }
-        };
-
-        recorder.onerror = (e) => {
-          console.error('MediaRecorder error:', e);
-          setMessages((prev) => [...prev, { role: 'assistant', content: 'Error recording audio: ' + e.error.message }]);
-          setIsRecording(false);
-          setIsTranscribing(false);
-        };
-
-        recorder.start();
-        setMediaRecorder(recorder);
+        setStatus("Listening");
         setIsRecording(true);
+        setError(null);
+        userAudioChunksRef.current = [];
+        pcmBufferRef.current = [];
+        isProcessingRef.current = false;
+        sessionIdRef.current += 1; // Increment session ID for new recording
 
-        stream.getTracks().forEach((track) => console.log('Track kind:', track.kind, 'state:', track.readyState));
+        if (websocket.readyState === WebSocket.OPEN) {
+          console.log("Sending start signal with voice model:", voiceModel);
+          websocket.send(JSON.stringify({ type: "start", voice_model: voiceModel }));
+        } else {
+          console.error("WebSocket is not open, state:", websocket.readyState);
+          setError("WebSocket is not open. Please try again.");
+          setIsRecording(false);
+          setStatus("Idle");
+          return;
+        }
+
+        // Get audio stream
+        try {
+          streamRef.current = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              noiseSuppression: true,
+              echoCancellation: true,
+              autoGainControl: true,
+              sampleRate: SAMPLE_RATE,
+              channelCount: 1,
+            },
+          });
+        } catch (err) {
+          console.error("Failed to access microphone:", err);
+          setError("Failed to access microphone. Please check permissions and try again.");
+          setIsRecording(false);
+          setStatus("Idle");
+          return;
+        }
+
+        // Set up audio context and nodes
+        const source = audioContextRef.current.createMediaStreamSource(streamRef.current);
+        analyserRef.current = audioContextRef.current.createAnalyser();
+        analyserRef.current.fftSize = 2048;
+        source.connect(analyserRef.current);
+
+        // Use ScriptProcessorNode to capture raw PCM data
+        processorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+        analyserRef.current.connect(processorRef.current);
+        processorRef.current.connect(audioContextRef.current.destination);
+
+        const dataArray = new Float32Array(analyserRef.current.fftSize);
+
+        // Capture PCM data
+        processorRef.current.onaudioprocess = (event) => {
+          const inputData = event.inputBuffer.getChannelData(0);
+          pcmBufferRef.current.push(...inputData);
+          console.log(`Captured ${inputData.length} PCM samples, total buffer: ${pcmBufferRef.current.length}`);
+        };
+
+        // Create PCM chunks every 1 second
+        chunkIntervalRef.current = setInterval(() => {
+          if (!isRecording) {
+            clearInterval(chunkIntervalRef.current);
+            return;
+          }
+
+          if (pcmBufferRef.current.length >= SAMPLES_PER_CHUNK) {
+            const pcmData = new Float32Array(pcmBufferRef.current.slice(0, SAMPLES_PER_CHUNK));
+            if (pcmData.length > 0) {
+              // Convert Float32Array to Int16Array (16-bit PCM)
+              const int16Data = new Int16Array(pcmData.length);
+              for (let i = 0; i < pcmData.length; i++) {
+                const sample = Math.max(-1, Math.min(1, pcmData[i])) * 0x7FFF; // Scale to 16-bit range
+                int16Data[i] = sample;
+              }
+              const pcmBlob = new Blob([int16Data.buffer], { type: "application/octet-stream" });
+              console.log(`Generated PCM chunk, size: ${pcmBlob.size} bytes`);
+
+              if (isProcessingRef.current) {
+                console.log("New speech detected while processing, discarding old chunks");
+                userAudioChunksRef.current = [];
+                isProcessingRef.current = false;
+                setStatus("Listening");
+                sessionIdRef.current += 1; // New session for new speech
+              }
+              userAudioChunksRef.current.push(pcmBlob);
+
+              if (isPlayingRef.current && websocket.readyState === WebSocket.OPEN) {
+                console.log("User interrupted bot, sending interruption signal");
+                websocket.send(JSON.stringify({ type: "user_interrupted" }));
+                isPlayingRef.current = false;
+                audioQueueRef.current = [];
+                setStatus("Listening");
+              }
+            }
+            pcmBufferRef.current = pcmBufferRef.current.slice(SAMPLES_PER_CHUNK);
+          }
+        }, CHUNK_DURATION_MS);
+
+        // Silence detection with fixed 2-second duration
+        silenceCheckIntervalRef.current = setInterval(() => {
+          if (!isRecording) {
+            clearInterval(silenceCheckIntervalRef.current);
+            return;
+          }
+
+          analyserRef.current.getFloatTimeDomainData(dataArray);
+          const rms = Math.sqrt(
+            dataArray.reduce((sum, val) => sum + val * val, 0) / dataArray.length
+          );
+
+          if (rms > SILENCE_THRESHOLD) {
+            console.log(`Speech detected, RMS: ${rms}`);
+            userAudioChunksRef.current.lastSpeechTime = Date.now();
+          } else if (userAudioChunksRef.current.length > 0) {
+            const now = Date.now();
+            const lastSpeechTime = userAudioChunksRef.current.lastSpeechTime || now;
+            if (now - lastSpeechTime >= SILENCE_DURATION) {
+              console.log("Silence detected for 2 seconds, sending chunks to backend");
+              sendAudioChunks();
+              userAudioChunksRef.current.lastSpeechTime = null; // Reset after sending
+            }
+          }
+        }, 100);
+
+        console.log("Recording started with 1000ms interval");
       } catch (error) {
-        console.error('Error accessing microphone:', error);
-        setMessages((prev) => [...prev, { role: 'assistant', content: 'Error accessing microphone. Please ensure permissions are granted: ' + error.message }]);
+        console.error("Error starting recording:", error);
+        setError("Failed to start recording: " + error.message);
         setIsRecording(false);
-        setIsTranscribing(false);
+        setStatus("Idle");
       }
     } else {
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
-        if (mediaRecorder.stream) {
-          mediaRecorder.stream.getTracks().forEach((track) => {
-            if (track.readyState === 'live') {
-              track.stop();
-              console.log('Stopping track:', track.kind);
-            }
-          });
-        }
+      setIsRecording(false);
+      setStatus("Idle");
+
+      // Clean up intervals
+      if (silenceCheckIntervalRef.current) {
+        clearInterval(silenceCheckIntervalRef.current);
+        silenceCheckIntervalRef.current = null;
       }
-      setMediaRecorder(null);
+      if (chunkIntervalRef.current) {
+        clearInterval(chunkIntervalRef.current);
+        chunkIntervalRef.current = null;
+      }
+
+      // Clean up audio nodes
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current = null;
+      }
+      if (analyserRef.current) {
+        analyserRef.current.disconnect();
+        analyserRef.current = null;
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+
+      // Send remaining chunks and close WebSocket
+      if (userAudioChunksRef.current.length > 0) {
+        sendAudioChunks();
+      }
+      if (websocket && websocket.readyState === WebSocket.OPEN) {
+        console.log("Sending end signal and closing WebSocket");
+        websocket.send(JSON.stringify({ type: "end" }));
+        websocket.close();
+        onDisconnect();
+      } else {
+        console.warn("WebSocket not available for closing");
+        onDisconnect();
+      }
     }
   };
 
   return (
-    <div className="flex flex-col h-full transition-all duration-300">
-      <div className="flex-1 overflow-y-auto p-4 bg-gray-800 rounded-lg shadow-inner border border-gray-700">
-        <style>
-          {`
-            .hide-scrollbar::-webkit-scrollbar {
-              display: none;
-            }
-            .hide-scrollbar {
-              scrollbar-width: none;
-              -ms-overflow-style: none;
-            }
-          `}
-        </style>
-        <AnimatePresence initial={false} mode="sync">
-          {messages.map((msg, index) => (
-            <motion.div
-              key={index}
-              className={`mb-6 flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.3 }}
-            >
-              <div
-                className={`max-w-[75%] p-4 rounded-xl break-words ${
-                  msg.role === 'user' ? 'bg-gradient-to-r from-cyan-600 to-blue-700 text-white shadow-lg' : 'bg-gray-700 text-gray-200 shadow-md'
-                }`}
-                style={{ wordBreak: 'break-word' }}
-              >
-                {msg.content}
-                {msg.audioUrl && msg.role === 'assistant' && (
-                  <motion.button
-                    onClick={() => handlePlayAudio(msg.audioUrl, index)}
-                    className="mt-2 flex items-center text-cyan-400 hover:text-cyan-300 transition duration-200"
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    aria-label={playingMessageId === index && isPlaying ? 'Pause Audio Response' : 'Play Audio Response'}
-                  >
-                    {playingMessageId === index && isPlaying ? (
-                      <FaPauseCircle className="mr-2" />
-                    ) : (
-                      <FaPlayCircle className="mr-2" />
-                    )}
-                    {playingMessageId === index && isPlaying ? 'Pause Response' : 'Play Response'}
-                  </motion.button>
-                )}
-              </div>
-            </motion.div>
-          ))}
-          {isBotTyping && (
-            <motion.div
-              key="typing-indicator"
-              className="mb-6 flex justify-start"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.3 }}
-            >
-              <div className="max-w-[75%] p-4 rounded-xl bg-gray-700 text-gray-400 italic shadow-md flex items-center">
-                <FaSpinner className="animate-spin mr-2" />
-                Bot is thinking...
-              </div>
-            </motion.div>
-          )}
-          {isTranscribing && (
-            <motion.div
-              key="transcribing-indicator"
-              className="mb-6 flex justify-start"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.3 }}
-            >
-              <div className="max-w-[75%] p-4 rounded-xl bg-gray-700 text-gray-400 italic shadow-md flex items-center">
-                <FaSpinner className="animate-spin mr-2" />
-                Transcribing audio...
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        <div ref={chatEndRef} />
-      </div>
-
-      <div className="mt-4 flex items-center space-x-3 p-3 bg-gray-800 rounded-lg shadow-lg border border-gray-700">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyPress={(e) => e.key === 'Enter' && handleSendMessage(input)}
-          placeholder={isRecording ? 'Recording...' : isTranscribing ? 'Processing audio...' : isBotTyping ? 'Waiting for response...' : 'Ask a question...'}
-          className={`flex-1 p-3 bg-gray-700 text-white rounded-lg focus:outline-none focus:ring-2 ${
-            isRecording ? 'focus:ring-red-500' : 'focus:ring-cyan-500'
-          } transition duration-200 placeholder-gray-500`}
-          disabled={isRecording || isTranscribing || isSending || isBotTyping}
-        />
-        <motion.button
-          onClick={handleRecord}
-          className={`p-3 rounded-full transition duration-200 ease-in-out flex items-center justify-center ${
-            isRecording ? 'bg-red-600 hover:bg-red-700 animate-pulse' : 'bg-cyan-600 hover:bg-cyan-700'
-          }`}
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.9 }}
-          aria-label={isRecording ? 'Stop Recording' : 'Start Recording'}
-          disabled={isTranscribing || isSending || isBotTyping}
-        >
-          {isRecording ? <FaStopCircle className="text-white text-xl" /> : <FaMicrophone className="text-white text-xl" />}
-        </motion.button>
-        <motion.button
-          onClick={() => handleSendMessage(input)}
-          className={`p-3 bg-cyan-600 rounded-full hover:bg-cyan-700 transition duration-200 ease-in-out flex items-center justify-center ${
-            isSending || !input.trim() || isRecording || isTranscribing || isBotTyping ? 'opacity-50 cursor-not-allowed' : ''
-          }`}
-          whileHover={{ scale: !input.trim() || isSending || isRecording || isTranscribing || isBotTyping ? 1 : 1.1 }}
-          whileTap={{ scale: !input.trim() || isSending || isRecording || isTranscribing || isBotTyping ? 1 : 0.9 }}
-          disabled={!input.trim() || isSending || isRecording || isTranscribing || isBotTyping}
-          aria-label="Send Message"
-        >
+    <div className="chatbot">
+      <div className="chat-window">
+        {messages.map((msg, index) => (
           <motion.div
-            initial={{ rotate: 0 }}
-            animate={{ rotate: isSending ? 360 : 0 }}
-            transition={{ duration: 0.5, loop: isSending ? Infinity : 0, ease: 'linear' }}
+            key={index}
+            className={`message ${msg.type}`}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
           >
-            <FaPaperPlane className="text-white text-xl" />
+            <strong>{msg.type === "user" ? "You" : "Bot"}:</strong> {msg.text}
           </motion.div>
-        </motion.button>
+        ))}
+        {error && (
+          <motion.div
+            className="message error"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <strong>Error:</strong> {error}
+          </motion.div>
+        )}
+      </div>
+      <div className="controls">
+        <button
+          onClick={toggleRecording}
+          disabled={!isConnected}
+          className={isRecording ? "recording" : ""}
+        >
+          {isRecording ? "Stop Call" : "Start Call"}
+        </button>
+        <div className="status">Status: {status}</div>
       </div>
     </div>
   );
-};
+}
 
 export default Chatbot;
