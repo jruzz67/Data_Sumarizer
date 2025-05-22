@@ -1,19 +1,19 @@
 import { useState, useEffect, useRef } from 'react';
-import { FaMicrophone, FaPaperPlane, FaStopCircle, FaSpinner, FaPlayCircle, FaPauseCircle } from 'react-icons/fa';
-import axios from 'axios';
+import { FaPhone, FaPhoneSlash, FaPlayCircle, FaPauseCircle } from 'react-icons/fa';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [isRecording, setIsRecording] = useState(false);
-  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [isInCall, setIsInCall] = useState(false);
+  const [websocket, setWebsocket] = useState(null);
   const chatEndRef = useRef(null);
-  const [isSending, setIsSending] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [isBotTyping, setIsBotTyping] = useState(false);
-  const [currentAudio, setCurrentAudio] = useState(null);
-  const [playingMessageId, setPlayingMessageId] = useState(null);
+  const audioContextRef = useRef(null);
+  const streamRef = useRef(null);
+  const processorRef = useRef(null);
+  const pcmBufferRef = useRef([]);
+  const silenceStartRef = useRef(null);
+  const currentAudioRef = useRef(null);
+  const playingMessageIdRef = useRef(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
   useEffect(() => {
@@ -25,68 +25,58 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
 
   useEffect(() => {
     return () => {
-      if (currentAudio) {
-        currentAudio.pause();
-        currentAudio.currentTime = 0;
-        setCurrentAudio(null);
-        setPlayingMessageId(null);
-        setIsPlaying(false);
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
+      }
+      if (websocket && websocket.readyState === WebSocket.OPEN) {
+        websocket.close();
+        setWebsocket(null);
+      }
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current = null;
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
       }
     };
-  }, [currentAudio]);
+  }, []);
 
-  const stopCurrentAudio = () => {
-    if (currentAudio) {
-      currentAudio.pause();
-      currentAudio.currentTime = 0;
-      setCurrentAudio(null);
-      setPlayingMessageId(null);
-      setIsPlaying(false);
+  const floatTo16BitPCM = (float32Array) => {
+    const int16Array = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32Array[i]));
+      int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
+    return int16Array;
   };
 
-  const handleSendMessage = async (queryText) => {
-    if (!queryText.trim() || isSending) return;
-
-    setIsSending(true);
-    const userMessage = { role: 'user', content: queryText };
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
-    setIsBotTyping(true);
-
-    try {
-      console.log('Sending query with voice model:', voiceModel);
-      const response = await axios.post('http://localhost:8000/query', { query: queryText, voice_model: voiceModel });
-      const botContent = response.data?.response || 'No response content received.';
-      const audioUrl = response.data?.audio_url;
-
-      const botMessage = { role: 'assistant', content: botContent, audioUrl };
-      setMessages((prev) => [...prev, botMessage]);
-    } catch (error) {
-      console.error('Error sending message:', error);
-      const errorMessage = {
-        role: 'assistant',
-        content: 'Error: ' + (error.response?.data?.detail || error.message || 'An unexpected error occurred.'),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
-    } finally {
-      setIsSending(false);
-      setIsBotTyping(false);
+  const isSilent = (float32Array) => {
+    const threshold = 0.02; // Adjust for sensitivity
+    for (let i = 0; i < float32Array.length; i++) {
+      if (Math.abs(float32Array[i]) > threshold) {
+        return false;
+      }
     }
+    return true;
   };
 
   const handlePlayAudio = (audioUrl, messageId) => {
     if (!audioUrl) return;
 
     const fullAudioUrl = audioUrl.startsWith('http') ? audioUrl : `http://localhost:8000${audioUrl}`;
-    console.log('Handling audio for:', fullAudioUrl);
-
-    if (playingMessageId === messageId && currentAudio) {
+    if (playingMessageIdRef.current === messageId && currentAudioRef.current) {
       if (isPlaying) {
-        currentAudio.pause();
+        currentAudioRef.current.pause();
         setIsPlaying(false);
       } else {
-        currentAudio.play().catch((e) => {
+        currentAudioRef.current.play().catch((e) => {
           console.error('Audio playback failed:', e);
           setMessages((prev) => [
             ...prev,
@@ -98,150 +88,185 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       return;
     }
 
-    stopCurrentAudio();
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
 
     const audio = new Audio(fullAudioUrl);
-    setCurrentAudio(audio);
-    setPlayingMessageId(messageId);
+    currentAudioRef.current = audio;
+    playingMessageIdRef.current = messageId;
     setIsPlaying(true);
 
     audio.oncanplay = () => {
-      console.log('Audio is ready to play');
       audio.play().catch((e) => {
         console.error('Audio playback failed:', e);
         setMessages((prev) => [
           ...prev,
           { role: 'assistant', content: 'Error playing audio: ' + e.message },
         ]);
-        setCurrentAudio(null);
-        setPlayingMessageId(null);
+        currentAudioRef.current = null;
+        playingMessageIdRef.current = null;
         setIsPlaying(false);
       });
     };
 
     audio.onended = () => {
-      setCurrentAudio(null);
-      setPlayingMessageId(null);
+      currentAudioRef.current = null;
+      playingMessageIdRef.current = null;
       setIsPlaying(false);
     };
 
-    audio.onerror = (e) => {
-      console.error('Audio loading error:', e);
+    audio.onerror = () => {
+      console.error('Audio loading error');
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: 'Error loading audio: ' + e.message },
+        { role: 'assistant', content: 'Error loading audio' },
       ]);
-      setCurrentAudio(null);
-      setPlayingMessageId(null);
+      currentAudioRef.current = null;
+      playingMessageIdRef.current = null;
       setIsPlaying(false);
     };
 
     audio.load();
   };
 
-  const handleRecord = async () => {
-    stopCurrentAudio();
+  const handleStartCall = async () => {
+    if (isInCall) return;
 
-    if (!isRecording) {
+    setIsInCall(true);
+    const ws = new WebSocket('ws://localhost:8000/ws/chat');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      console.log('WebSocket connection established');
+      setWebsocket(ws);
+    };
+    ws.onmessage = (event) => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const options = { mimeType: 'audio/webm;codecs=opus' };
-        if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-          options.mimeType = 'audio/webm';
-          if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-            console.error('No supported audio MIME type found for MediaRecorder.');
-            setMessages((prev) => [...prev, { role: 'assistant', content: 'Error: Your browser does not support audio recording.' }]);
-            return;
-          }
+        const data = JSON.parse(event.data);
+        if (data.type === 'response') {
+          const botMessage = {
+            role: 'assistant',
+            content: data.response || 'No response received.',
+            audioUrl: data.audio_url,
+          };
+          setMessages((prev) => [...prev, botMessage]);
+        } else if (data.type === 'error') {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', content: 'Error: ' + data.message },
+          ]);
         }
-        console.log('Using MIME type:', options.mimeType);
-
-        const recorder = new MediaRecorder(stream, options);
-        const chunks = [];
-
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) {
-            chunks.push(e.data);
-            console.log('Chunk received:', e.data.size);
-          }
-        };
-
-        recorder.onstop = async () => {
-          console.log('Recording stopped, total chunks size:', chunks.reduce((acc, chunk) => acc + chunk.size, 0));
-          setIsRecording(false);
-          setIsTranscribing(true);
-
-          if (chunks.length === 0 || chunks.reduce((acc, chunk) => acc + chunk.size, 0) === 0) {
-            setMessages((prev) => [...prev, { role: 'assistant', content: 'Error: No valid audio data recorded.' }]);
-            setIsTranscribing(false);
-            return;
-          }
-
-          const audioBlob = new Blob(chunks, { type: options.mimeType });
-          console.log('Audio Blob:', audioBlob, 'Size:', audioBlob.size);
-
-          const formData = new FormData();
-          formData.append('file', audioBlob, 'recording.webm');
-
-          try {
-            const response = await axios.post('http://localhost:8000/transcribe', formData);
-            const transcribedText = response.data?.transcribed_text;
-
-            if (!transcribedText) {
-              setMessages((prev) => [...prev, { role: 'assistant', content: 'Transcription failed: Received empty text.' }]);
-              return;
-            }
-
-            setInput(transcribedText);
-            handleSendMessage(transcribedText);
-          } catch (error) {
-            console.error('Error transcribing audio:', error);
-            setMessages((prev) => [
-              ...prev,
-              { role: 'assistant', content: 'Error transcribing audio: ' + (error.response?.data?.detail || error.message || 'An unexpected error occurred.') },
-            ]);
-          } finally {
-            setIsTranscribing(false);
-          }
-        };
-
-        recorder.onerror = (e) => {
-          console.error('MediaRecorder error:', e);
-          setMessages((prev) => [...prev, { role: 'assistant', content: 'Error recording audio: ' + e.error.message }]);
-          setIsRecording(false);
-          setIsTranscribing(false);
-        };
-
-        recorder.start();
-        setMediaRecorder(recorder);
-        setIsRecording(true);
-
-        stream.getTracks().forEach((track) => console.log('Track kind:', track.kind, 'state:', track.readyState));
-      } catch (error) {
-        console.error('Error accessing microphone:', error);
-        setMessages((prev) => [...prev, { role: 'assistant', content: 'Error accessing microphone. Please ensure permissions are granted: ' + error.message }]);
-        setIsRecording(false);
-        setIsTranscribing(false);
+      } catch (e) {
+        console.error('Error parsing WebSocket message:', e);
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: 'Error processing message' },
+        ]);
       }
-    } else {
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
-        if (mediaRecorder.stream) {
-          mediaRecorder.stream.getTracks().forEach((track) => {
-            if (track.readyState === 'live') {
-              track.stop();
-              console.log('Stopping track:', track.kind);
-            }
-          });
+    };
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'WebSocket error' },
+      ]);
+      setIsInCall(false);
+    };
+    ws.onclose = () => {
+      console.log('WebSocket closed');
+      setWebsocket(null);
+      setIsInCall(false);
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current = null;
+      }
+    };
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true },
+      });
+      streamRef.current = stream;
+      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      source.connect(processor);
+      processor.connect(audioContextRef.current.destination);
+
+      processor.onaudioprocess = (event) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          return;
         }
-      }
-      setMediaRecorder(null);
+        const input = event.inputBuffer.getChannelData(0);
+        const int16PCM = floatTo16BitPCM(new Float32Array(input));
+        pcmBufferRef.current.push(int16PCM);
+
+        if (isSilent(input)) {
+          if (!silenceStartRef.current) {
+            silenceStartRef.current = Date.now();
+          } else if (Date.now() - silenceStartRef.current >= 2000) {
+            if (pcmBufferRef.current.length > 0) {
+              const totalSamples = pcmBufferRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
+              const combinedPCM = new Int16Array(totalSamples);
+              let offset = 0;
+              pcmBufferRef.current.forEach((chunk) => {
+                combinedPCM.set(chunk, offset);
+                offset += chunk.length;
+              });
+              ws.send(combinedPCM.buffer);
+              console.log(`[${new Date().toISOString()}] Sent PCM: ${totalSamples} samples`);
+              pcmBufferRef.current = [];
+            }
+            silenceStartRef.current = null;
+          }
+        } else {
+          silenceStartRef.current = null;
+        }
+      };
+
+      console.log('Call started, streaming PCM audio');
+    } catch (error) {
+      console.error('Error starting call:', error);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Error accessing microphone: ' + error.message },
+      ]);
+      setIsInCall(false);
+      if (ws) ws.close();
     }
   };
 
+  const handleEndCall = () => {
+    if (!isInCall) return;
+
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (websocket && websocket.readyState === WebSocket.OPEN) {
+      websocket.close();
+    }
+    setWebsocket(null);
+    setIsInCall(false);
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    pcmBufferRef.current = [];
+    silenceStartRef.current = null;
+    console.log('Call ended');
+  };
+
   return (
-    <div className="flex flex-col h-full transition-all duration-300">
-      <div className="flex-1 overflow-y-auto p-4 bg-gray-800 rounded-lg shadow-inner border border-gray-700">
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto p-4 bg-gray-800 rounded-lg border border-gray-700">
         <style>
           {`
             .hide-scrollbar::-webkit-scrollbar {
@@ -253,19 +278,19 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
             }
           `}
         </style>
-        <AnimatePresence initial={false} mode="sync">
+        <AnimatePresence>
           {messages.map((msg, index) => (
             <motion.div
               key={index}
-              className={`mb-6 flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+              className={`mb-4 flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
               transition={{ duration: 0.3 }}
             >
               <div
-                className={`max-w-[75%] p-4 rounded-xl break-words ${
-                  msg.role === 'user' ? 'bg-gradient-to-r from-cyan-600 to-blue-700 text-white shadow-lg' : 'bg-gray-700 text-gray-200 shadow-md'
+                className={`max-w-[75%] p-3 rounded-lg ${
+                  msg.role === 'user' ? 'bg-cyan-600 text-white' : 'bg-gray-700 text-gray-200'
                 }`}
                 style={{ wordBreak: 'break-word' }}
               >
@@ -273,97 +298,38 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
                 {msg.audioUrl && msg.role === 'assistant' && (
                   <motion.button
                     onClick={() => handlePlayAudio(msg.audioUrl, index)}
-                    className="mt-2 flex items-center text-cyan-400 hover:text-cyan-300 transition duration-200"
+                    className="mt-2 flex items-center text-cyan-400 hover:text-cyan-300"
                     whileHover={{ scale: 1.05 }}
                     whileTap={{ scale: 0.95 }}
-                    aria-label={playingMessageId === index && isPlaying ? 'Pause Audio Response' : 'Play Audio Response'}
+                    aria-label={playingMessageIdRef.current === index && isPlaying ? 'Pause Audio' : 'Play Audio'}
                   >
-                    {playingMessageId === index && isPlaying ? (
-                      <FaPauseCircle className="mr-2" />
+                    {playingMessageIdRef.current === index && isPlaying ? (
+                      <FaPauseCircle className="mr-1" />
                     ) : (
-                      <FaPlayCircle className="mr-2" />
+                      <FaPlayCircle className="mr-1" />
                     )}
-                    {playingMessageId === index && isPlaying ? 'Pause Response' : 'Play Response'}
+                    {playingMessageIdRef.current === index && isPlaying ? 'Pause' : 'Play'}
                   </motion.button>
                 )}
               </div>
             </motion.div>
           ))}
-          {isBotTyping && (
-            <motion.div
-              key="typing-indicator"
-              className="mb-6 flex justify-start"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.3 }}
-            >
-              <div className="max-w-[75%] p-4 rounded-xl bg-gray-700 text-gray-400 italic shadow-md flex items-center">
-                <FaSpinner className="animate-spin mr-2" />
-                Bot is thinking...
-              </div>
-            </motion.div>
-          )}
-          {isTranscribing && (
-            <motion.div
-              key="transcribing-indicator"
-              className="mb-6 flex justify-start"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.3 }}
-            >
-              <div className="max-w-[75%] p-4 rounded-xl bg-gray-700 text-gray-400 italic shadow-md flex items-center">
-                <FaSpinner className="animate-spin mr-2" />
-                Transcribing audio...
-              </div>
-            </motion.div>
-          )}
         </AnimatePresence>
         <div ref={chatEndRef} />
       </div>
 
-      <div className="mt-4 flex items-center space-x-3 p-3 bg-gray-800 rounded-lg shadow-lg border border-gray-700">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyPress={(e) => e.key === 'Enter' && handleSendMessage(input)}
-          placeholder={isRecording ? 'Recording...' : isTranscribing ? 'Processing audio...' : isBotTyping ? 'Waiting for response...' : 'Ask a question...'}
-          className={`flex-1 p-3 bg-gray-700 text-white rounded-lg focus:outline-none focus:ring-2 ${
-            isRecording ? 'focus:ring-red-500' : 'focus:ring-cyan-500'
-          } transition duration-200 placeholder-gray-500`}
-          disabled={isRecording || isTranscribing || isSending || isBotTyping}
-        />
+      <div className="mt-4 p-3 bg-gray-800 rounded-lg border border-gray-700">
         <motion.button
-          onClick={handleRecord}
-          className={`p-3 rounded-full transition duration-200 ease-in-out flex items-center justify-center ${
-            isRecording ? 'bg-red-600 hover:bg-red-700 animate-pulse' : 'bg-cyan-600 hover:bg-cyan-700'
-          }`}
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.9 }}
-          aria-label={isRecording ? 'Stop Recording' : 'Start Recording'}
-          disabled={isTranscribing || isSending || isBotTyping}
+          onClick={isInCall ? handleEndCall : handleStartCall}
+          className={`w-full p-3 rounded-lg ${
+            isInCall ? 'bg-red-600 hover:bg-red-700' : 'bg-cyan-600 hover:bg-cyan-700'
+          } text-white flex justify-center items-center`}
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          aria-label={isInCall ? 'End Call' : 'Start Call'}
         >
-          {isRecording ? <FaStopCircle className="text-white text-xl" /> : <FaMicrophone className="text-white text-xl" />}
-        </motion.button>
-        <motion.button
-          onClick={() => handleSendMessage(input)}
-          className={`p-3 bg-cyan-600 rounded-full hover:bg-cyan-700 transition duration-200 ease-in-out flex items-center justify-center ${
-            isSending || !input.trim() || isRecording || isTranscribing || isBotTyping ? 'opacity-50 cursor-not-allowed' : ''
-          }`}
-          whileHover={{ scale: !input.trim() || isSending || isRecording || isTranscribing || isBotTyping ? 1 : 1.1 }}
-          whileTap={{ scale: !input.trim() || isSending || isRecording || isTranscribing || isBotTyping ? 1 : 0.9 }}
-          disabled={!input.trim() || isSending || isRecording || isTranscribing || isBotTyping}
-          aria-label="Send Message"
-        >
-          <motion.div
-            initial={{ rotate: 0 }}
-            animate={{ rotate: isSending ? 360 : 0 }}
-            transition={{ duration: 0.5, loop: isSending ? Infinity : 0, ease: 'linear' }}
-          >
-            <FaPaperPlane className="text-white text-xl" />
-          </motion.div>
+          {isInCall ? <FaPhoneSlash className="mr-2" /> : <FaPhone className="mr-2" />}
+          {isInCall ? 'End Call' : 'Start Call'}
         </motion.button>
       </div>
     </div>

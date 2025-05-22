@@ -3,6 +3,19 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from dotenv import load_dotenv
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -14,10 +27,13 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 
 def init_db():
     """
-    Initialize the database, create the 'chunks' table if it doesn't exist, and enable the vector extension.
+    Initialize the database, create the 'chunks' table if it doesn't exist, enable the vector extension,
+    and create an HNSW index for faster vector searches.
     """
     conn = None
     try:
+        start_time = time.time()
+        # Connect to default 'postgres' database to check/create target database
         conn = psycopg2.connect(
             dbname="postgres",
             user=DB_USER,
@@ -31,10 +47,12 @@ def init_db():
         cursor.execute(f"SELECT 1 FROM pg_database WHERE datname = '{DB_NAME}'")
         if not cursor.fetchone():
             cursor.execute(f"CREATE DATABASE {DB_NAME}")
+            logger.info(f"Created database: {DB_NAME}")
 
         cursor.close()
         conn.close()
 
+        # Connect to target database
         conn = psycopg2.connect(
             dbname=DB_NAME,
             user=DB_USER,
@@ -44,7 +62,9 @@ def init_db():
         )
         cursor = conn.cursor()
 
+        # Enable vector extension
         cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        logger.info("Vector extension enabled")
 
         # Check if chunks table exists
         cursor.execute("""
@@ -64,13 +84,23 @@ def init_db():
                     embedding vector(768)
                 );
             """)
-            print("Created chunks table.")
+            logger.info("Created chunks table")
         else:
-            print("Chunks table already exists, skipping creation.")
+            logger.info("Chunks table already exists, skipping creation")
+
+        # Create HNSW index for cosine distance searches
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS chunks_embedding_idx 
+            ON chunks 
+            USING hnsw (embedding vector_cosine_ops) 
+            WITH (m = 16, ef_construction = 64);
+        """)
+        logger.info("Created HNSW index on chunks.embedding")
 
         conn.commit()
+        logger.info(f"Database initialized in {time.time() - start_time:.3f}s")
     except Exception as e:
-        print(f"Error initializing database: {str(e)}")
+        logger.error(f"Error initializing database: {str(e)}")
         raise
     finally:
         if conn:
@@ -95,6 +125,7 @@ def get_db():
 def truncate_table():
     conn = None
     try:
+        start_time = time.time()
         conn = psycopg2.connect(
             dbname=DB_NAME,
             user=DB_USER,
@@ -105,9 +136,9 @@ def truncate_table():
         cursor = conn.cursor()
         cursor.execute("TRUNCATE TABLE chunks RESTART IDENTITY;")
         conn.commit()
-        print("Successfully truncated the chunks table.")
+        logger.info(f"Truncated chunks table in {time.time() - start_time:.3f}s")
     except Exception as e:
-        print(f"Error truncating table: {str(e)}")
+        logger.error(f"Error truncating table: {str(e)}")
         raise
     finally:
         if conn:

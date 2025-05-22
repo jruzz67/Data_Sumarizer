@@ -6,7 +6,7 @@ app.log
 
 Environment variables
 .env
-
+models/
 Temporary files
 *.pyc
 pycache/
