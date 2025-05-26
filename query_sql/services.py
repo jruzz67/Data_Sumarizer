@@ -7,11 +7,9 @@ import wave
 import numpy as np
 from pathlib import Path
 from vosk import Model, KaldiRecognizer
-from TTS.api import TTS
-import torch.serialization
-import collections
 import aiofiles
 import base64
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -28,71 +26,11 @@ if not os.path.exists(VOSK_MODEL_PATH):
 vosk_model = Model(VOSK_MODEL_PATH)
 logger.info("Vosk model loaded successfully")
 
-VOICE_MODELS = {
-    "female": {"model_name": "tts_models/en/ljspeech/tacotron2-DDC", "speaker": None},
-    "male": {"model_name": "tts_models/en/vctk/vits", "speaker": "p239"},
+PIPER_BINARY = r"D:\Projects\OCR_with_PostgresSQL\query_sql\models\piper\piper.exe"
+PIPER_MODELS = {
+    "female": r"D:\Projects\OCR_with_PostgresSQL\query_sql\models\piper_models\en_US-amy-medium.onnx",
+    "male": r"D:\Projects\OCR_with_PostgresSQL\query_sql\models\piper_models\en_US-joe-medium.onnx"
 }
-
-espeak_path = r"C:\Program Files\eSpeak NG"
-if os.path.exists(espeak_path):
-    os.environ["PATH"] = espeak_path + os.pathsep + os.environ.get("PATH", "")
-    logger.info(f"Added {espeak_path} to PATH for espeak-ng")
-else:
-    logger.warning(f"espeak-ng path {espeak_path} not found. VITS models may fail to load.")
-
-try:
-    from TTS.utils.radam import RAdam
-    torch.serialization.add_safe_globals([RAdam, collections.defaultdict, dict])
-    logger.info("Added TTS.utils.radam.RAdam, collections.defaultdict, and dict to PyTorch safe globals")
-except ImportError:
-    logger.error("Failed to import TTS.utils.radam.RAdam for allowlisting")
-    raise
-
-TTS_MODEL_DIR = Path("C:/Users/ASUS/AppData/Local/tts")
-
-def clean_tts_model_directory(model_name: str):
-    model_dir = TTS_MODEL_DIR / model_name.replace('/', '--')
-    if model_dir.exists():
-        try:
-            shutil.rmtree(model_dir)
-            logger.info(f"Cleaned up TTS model directory: {model_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up TTS model directory {model_dir}: {str(e)}")
-
-UNUSED_MODELS = [
-    "tts_models/en/jenny/jenny",
-    "tts_models/en/ljspeech/glow-tts",
-    "tts_models/en/ek1/tacotron2",
-    "tts_models/en/ljspeech/fast_pitch",
-]
-for model_name in UNUSED_MODELS:
-    clean_tts_model_directory(model_name)
-
-TTS_MODELS = {}
-try:
-    for voice_label, config in VOICE_MODELS.items():
-        model_name = config["model_name"]
-        if model_name not in TTS_MODELS:
-            model_dir = TTS_MODEL_DIR / model_name.replace('/', '--')
-            if model_dir.exists():
-                logger.info(f"TTS model directory exists: {model_dir}")
-            else:
-                logger.info(f"TTS model directory not found, will download: {model_dir}")
-            try:
-                logger.info(f"Attempting to load TTS model: {model_name}")
-                TTS_MODELS[model_name] = TTS(model_name=model_name, progress_bar=False)
-                logger.info(f"Successfully loaded TTS model: {model_name}")
-            except Exception as e:
-                logger.error(f"Failed to load TTS model {model_name}: {str(e)}")
-                clean_tts_model_directory(model_name)
-                if model_name != "tts_models/en/ljspeech/tacotron2-DDC":
-                    logger.info(f"Falling back to default TTS model for {voice_label}")
-                    TTS_MODELS[model_name] = TTS_MODELS.get("tts_models/en/ljspeech/tacotron2-DDC")
-                else:
-                    raise
-except Exception as e:
-    logger.error(f"Critical failure in loading TTS models: {str(e)}")
-    raise
 
 def decode_base64_pcm(base64_str: str) -> np.ndarray:
     try:
@@ -193,24 +131,24 @@ def text_to_speech(text: str, output_path: str, voice_model: str = "female") -> 
     try:
         start_time = time.time()
         logger.info(f"Using voice model: {voice_model}")
-        if voice_model not in VOICE_MODELS:
-            logger.warning(f"Invalid voice model: {voice_model}, falling back to 'female'")
-            voice_model = "female"
-        config = VOICE_MODELS[voice_model]
-        model_name = config["model_name"]
-        tts_model = TTS_MODELS.get(model_name)
-        if not tts_model:
-            logger.error(f"TTS model {model_name} not loaded, falling back to default")
-            voice_model = "female"
-            config = VOICE_MODELS[voice_model]
-            tts_model = TTS_MODELS[config["model_name"]]
-        speaker = config["speaker"]
-        logger.info(f"Generating TTS with model: {model_name}, speaker: {speaker}")
-        if speaker:
-            tts_model.tts_to_file(text=text, file_path=output_path, speaker=speaker)
-        else:
-            tts_model.tts_to_file(text=text, file_path=output_path, speaker_wav=None)
+        model_path = PIPER_MODELS.get(voice_model, PIPER_MODELS["female"])
+        if not os.path.exists(model_path):
+            logger.error(f"Piper model not found at {model_path}")
+            raise FileNotFoundError(f"Piper model not found at {model_path}")
+        if not os.path.exists(PIPER_BINARY):
+            logger.error(f"Piper binary not found at {PIPER_BINARY}")
+            raise FileNotFoundError(f"Piper binary not found at {PIPER_BINARY}")
+        logger.info(f"Generating TTS with model: {model_path}")
+        subprocess.run(
+            [PIPER_BINARY, "--model", model_path, "--output_file", output_path],
+            input=text.encode(),
+            check=True,
+            capture_output=True
+        )
         logger.info(f"Generated speech saved to {output_path} in {time.time() - start_time:.3f}s")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Piper TTS failed: {e.stderr.decode()}")
+        raise
     except Exception as e:
         logger.error(f"Error in text-to-speech: {str(e)}")
         raise
