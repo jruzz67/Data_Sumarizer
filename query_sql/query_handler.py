@@ -37,8 +37,9 @@ def handle_query(query_text: str, top_chunks: list, chunk_metadata: list = None)
     Returns:
         str: The generated response.
     """
+    logger.info(f"Received query for processing: {query_text}")
     if not top_chunks:
-        logger.info("No relevant chunks found for query")
+        logger.warning("No relevant chunks found for query: {query_text}")
         return "No relevant chunks found"
 
     try:

@@ -122,6 +122,13 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     audio.load();
   };
 
+  useEffect(() => {
+    const lastMessage = messages[messages.length - 1];
+    if (lastMessage && lastMessage.role === 'assistant' && lastMessage.audioUrl && playingMessageIdRef.current !== messages.length - 1) {
+      handlePlayAudio(lastMessage.audioUrl, messages.length - 1);
+    }
+  }, [messages]);
+
   const handleStartCall = async () => {
     if (isInCall) return;
     setIsInCall(true);
@@ -189,7 +196,7 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       processorRef.current = processor;
       source.connect(processor);
       processor.connect(audioContextRef.current.destination);
-      const silenceThreshold = 0.02;
+      const silenceThreshold = 0.005;
       const silenceChunksRequired = 1; // ~512ms silence
       processor.onaudioprocess = (event) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;

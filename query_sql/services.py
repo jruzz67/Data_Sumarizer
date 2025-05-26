@@ -48,7 +48,7 @@ def concatenate_chunks(chunks: list) -> np.ndarray:
         logger.error(f"Error concatenating chunks: {str(e)}")
         raise
 
-def verify_trailing_silence(pcm: np.ndarray, sample_rate: int = 16000, silence_duration: float = 0.5, threshold: float = 20.0) -> bool:
+def verify_trailing_silence(pcm: np.ndarray, sample_rate: int = 16000, silence_duration: float = 0.5, threshold: float = 14.0) -> bool:
     try:
         samples_to_check = int(sample_rate * silence_duration)
         if len(pcm) < samples_to_check:
@@ -83,7 +83,7 @@ async def write_pcm_to_wav(pcm_data: bytes, output_path: str, sample_rate: int =
 async def process_audio(pcm: np.ndarray) -> str:
     try:
         start_time = time.time()
-        if len(pcm) < 8000:  # ~0.5s at 16kHz
+        if len(pcm) < 16000:  # ~1s at 16kHz
             logger.warning(f"PCM too short for transcription: {len(pcm)} samples")
             return ""
         wav_path = UPLOAD_DIR / f"audio_{int(time.time())}.wav"
@@ -98,7 +98,7 @@ async def process_audio(pcm: np.ndarray) -> str:
                     break
                 if recognizer.AcceptWaveform(data):
                     result = recognizer.Result()
-                    logger.info(f"Raw Vosk result: {result}")
+                    logger.info(f"Partial Vosk result: {result}")
                     try:
                         text = json.loads(result).get("text", "")
                         if text:
@@ -117,6 +117,10 @@ async def process_audio(pcm: np.ndarray) -> str:
                 logger.error(f"Error parsing final Vosk result: {str(e)}")
         transcribed_text = transcribed_text.strip()
         logger.info(f"Transcription completed: {transcribed_text} in {time.time() - start_time:.3f}s")
+        # Save a debug copy of the WAV file
+        debug_wav = UPLOAD_DIR / f"debug_{wav_path.name}"
+        shutil.copy(wav_path, debug_wav)
+        logger.info(f"Saved debug WAV: {debug_wav}")
         os.remove(wav_path)
         logger.info(f"Deleted WAV: {wav_path}")
         return transcribed_text
