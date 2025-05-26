@@ -10,11 +10,11 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
   const processorRef = useRef(null);
-  const pcmBufferRef = useRef([]);
-  const silenceStartRef = useRef(null);
   const currentAudioRef = useRef(null);
   const playingMessageIdRef = useRef(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const sequenceRef = useRef(0);
+  const silenceCountRef = useRef(0);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -57,19 +57,16 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     return int16Array;
   };
 
-  const isSilent = (float32Array) => {
-    const threshold = 0.02; // Adjust for sensitivity
+  const calculateRMS = (float32Array) => {
+    let sum = 0;
     for (let i = 0; i < float32Array.length; i++) {
-      if (Math.abs(float32Array[i]) > threshold) {
-        return false;
-      }
+      sum += float32Array[i] * float32Array[i];
     }
-    return true;
+    return Math.sqrt(sum / float32Array.length);
   };
 
   const handlePlayAudio = (audioUrl, messageId) => {
     if (!audioUrl) return;
-
     const fullAudioUrl = audioUrl.startsWith('http') ? audioUrl : `http://localhost:8000${audioUrl}`;
     if (playingMessageIdRef.current === messageId && currentAudioRef.current) {
       if (isPlaying) {
@@ -87,17 +84,14 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       }
       return;
     }
-
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
     }
-
     const audio = new Audio(fullAudioUrl);
     currentAudioRef.current = audio;
     playingMessageIdRef.current = messageId;
     setIsPlaying(true);
-
     audio.oncanplay = () => {
       audio.play().catch((e) => {
         console.error('Audio playback failed:', e);
@@ -110,13 +104,11 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
         setIsPlaying(false);
       });
     };
-
     audio.onended = () => {
       currentAudioRef.current = null;
       playingMessageIdRef.current = null;
       setIsPlaying(false);
     };
-
     audio.onerror = () => {
       console.error('Audio loading error');
       setMessages((prev) => [
@@ -127,16 +119,13 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       playingMessageIdRef.current = null;
       setIsPlaying(false);
     };
-
     audio.load();
   };
 
   const handleStartCall = async () => {
     if (isInCall) return;
-
     setIsInCall(true);
     const ws = new WebSocket('ws://localhost:8000/ws/chat');
-    ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       console.log('WebSocket connection established');
       setWebsocket(ws);
@@ -144,13 +133,20 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type === 'response') {
-          const botMessage = {
-            role: 'assistant',
-            content: data.response || 'No response received.',
-            audioUrl: data.audio_url,
-          };
-          setMessages((prev) => [...prev, botMessage]);
+        if (data.type === 'transcription') {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'user', content: data.text || 'No transcription received' },
+          ]);
+        } else if (data.type === 'response') {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: 'assistant',
+              content: data.response || 'No response received',
+              audioUrl: data.audio_url,
+            },
+          ]);
         } else if (data.type === 'error') {
           setMessages((prev) => [
             ...prev,
@@ -182,7 +178,6 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
         processorRef.current = null;
       }
     };
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true },
@@ -190,44 +185,33 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       streamRef.current = stream;
       audioContextRef.current = new AudioContext({ sampleRate: 16000 });
       const source = audioContextRef.current.createMediaStreamSource(stream);
-      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+      const processor = audioContextRef.current.createScriptProcessor(8192, 1, 1);
       processorRef.current = processor;
-
       source.connect(processor);
       processor.connect(audioContextRef.current.destination);
-
+      const silenceThreshold = 0.02;
+      const silenceChunksRequired = 1; // ~512ms silence
       processor.onaudioprocess = (event) => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          return;
-        }
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const input = event.inputBuffer.getChannelData(0);
+        const rms = calculateRMS(input);
+        const isSilentChunk = rms < silenceThreshold;
+        if (isSilentChunk) silenceCountRef.current++;
+        else silenceCountRef.current = 0;
+        const silenceFlag = silenceCountRef.current >= silenceChunksRequired ? 0 : 1;
         const int16PCM = floatTo16BitPCM(new Float32Array(input));
-        pcmBufferRef.current.push(int16PCM);
-
-        if (isSilent(input)) {
-          if (!silenceStartRef.current) {
-            silenceStartRef.current = Date.now();
-          } else if (Date.now() - silenceStartRef.current >= 2000) {
-            if (pcmBufferRef.current.length > 0) {
-              const totalSamples = pcmBufferRef.current.reduce((sum, chunk) => sum + chunk.length, 0);
-              const combinedPCM = new Int16Array(totalSamples);
-              let offset = 0;
-              pcmBufferRef.current.forEach((chunk) => {
-                combinedPCM.set(chunk, offset);
-                offset += chunk.length;
-              });
-              ws.send(combinedPCM.buffer);
-              console.log(`[${new Date().toISOString()}] Sent PCM: ${totalSamples} samples`);
-              pcmBufferRef.current = [];
-            }
-            silenceStartRef.current = null;
-          }
-        } else {
-          silenceStartRef.current = null;
-        }
+        const pcmBase64 = btoa(String.fromCharCode.apply(null, new Uint8Array(int16PCM.buffer)));
+        const message = JSON.stringify({
+          sequence: sequenceRef.current,
+          silence: silenceFlag,
+          pcm: pcmBase64,
+        });
+        ws.send(message);
+        console.log(`[${new Date().toISOString()}] Sent chunk: sequence=${sequenceRef.current}, silence=${silenceFlag}`);
+        sequenceRef.current++;
+        if (silenceFlag === 0) sequenceRef.current = 0;
       };
-
-      console.log('Call started, streaming PCM audio');
+      console.log('Call started, streaming audio chunks');
     } catch (error) {
       console.error('Error starting call:', error);
       setMessages((prev) => [
@@ -241,7 +225,6 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
 
   const handleEndCall = () => {
     if (!isInCall) return;
-
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current = null;
@@ -259,8 +242,8 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       audioContextRef.current.close();
       audioContextRef.current = null;
     }
-    pcmBufferRef.current = [];
-    silenceStartRef.current = null;
+    sequenceRef.current = 0;
+    silenceCountRef.current = 0;
     console.log('Call ended');
   };
 
@@ -317,7 +300,6 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
         </AnimatePresence>
         <div ref={chatEndRef} />
       </div>
-
       <div className="mt-4 p-3 bg-gray-800 rounded-lg border border-gray-700">
         <motion.button
           onClick={isInCall ? handleEndCall : handleStartCall}

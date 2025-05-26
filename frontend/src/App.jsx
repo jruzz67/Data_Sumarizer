@@ -9,7 +9,7 @@ import './BackgroundAnimation.css';
 const App = () => {
   const [isPanelOpen, setIsPanelOpen] = useState(false);
   const [voiceModel, setVoiceModel] = useState('female');
-  const panelWidth = 'min(25vw, 400px)'; // Responsive panel width
+  const panelWidth = 'min(25vw, 400px)';
 
   const handleVoiceModelChange = (newVoiceModel) => {
     console.log('Voice model updated in App:', newVoiceModel);
@@ -18,12 +18,10 @@ const App = () => {
 
   return (
     <div className="relative min-h-screen overflow-hidden">
-      {/* Background Animation Layer */}
       <div className="background-animation-layer">
         <div className="gradient-bg"></div>
         <div className="particles"></div>
       </div>
-
       <div className="relative z-10 flex flex-col min-h-screen text-gray-200">
         <Header onVoiceModelChange={handleVoiceModelChange} />
         <main className="flex flex-1 overflow-hidden transition-all duration-300 ease-in-out">

@@ -11,6 +11,7 @@ from TTS.api import TTS
 import torch.serialization
 import collections
 import aiofiles
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +94,42 @@ except Exception as e:
     logger.error(f"Critical failure in loading TTS models: {str(e)}")
     raise
 
+def decode_base64_pcm(base64_str: str) -> np.ndarray:
+    try:
+        pcm_bytes = base64.b64decode(base64_str)
+        return np.frombuffer(pcm_bytes, dtype=np.int16)
+    except Exception as e:
+        logger.error(f"Error decoding base64 PCM: {str(e)}")
+        raise
+
+def concatenate_chunks(chunks: list) -> np.ndarray:
+    try:
+        sorted_chunks = sorted(chunks, key=lambda x: x['sequence'])
+        return np.concatenate([chunk['pcm'] for chunk in sorted_chunks])
+    except Exception as e:
+        logger.error(f"Error concatenating chunks: {str(e)}")
+        raise
+
+def verify_trailing_silence(pcm: np.ndarray, sample_rate: int = 16000, silence_duration: float = 0.5, threshold: float = 20.0) -> bool:
+    try:
+        samples_to_check = int(sample_rate * silence_duration)
+        if len(pcm) < samples_to_check:
+            logger.warning(f"PCM too short for silence verification: {len(pcm)} samples")
+            return False
+        trailing_samples = pcm[-samples_to_check:]
+        rms = np.sqrt(np.mean(trailing_samples**2))
+        logger.info(f"Trailing RMS: {rms:.4f}, threshold: {threshold}")
+        return rms < threshold
+    except Exception as e:
+        logger.error(f"Error verifying trailing silence: {str(e)}")
+        return False
+
 async def write_pcm_to_wav(pcm_data: bytes, output_path: str, sample_rate: int = 16000) -> None:
     try:
         start_time = time.time()
         if not pcm_data:
             logger.error("PCM data is empty")
             raise ValueError("PCM data is empty")
-
         int16_array = np.frombuffer(pcm_data, dtype=np.int16)
         async with aiofiles.open(output_path, 'wb') as f:
             with wave.open(f.name, 'wb') as wf:
@@ -107,27 +137,22 @@ async def write_pcm_to_wav(pcm_data: bytes, output_path: str, sample_rate: int =
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
                 wf.writeframes(int16_array.tobytes())
-
         logger.info(f"Successfully wrote PCM to WAV: {output_path} in {time.time() - start_time:.3f}s")
     except Exception as e:
         logger.error(f"Error writing PCM to WAV: {str(e)}")
         raise
 
-async def process_audio(pcm_data: bytes) -> str:
+async def process_audio(pcm: np.ndarray) -> str:
     try:
         start_time = time.time()
-        logger.info(f"Processing PCM of size: {len(pcm_data)} bytes")
-        if not pcm_data:
-            logger.warning("Empty PCM received")
+        if len(pcm) < 8000:  # ~0.5s at 16kHz
+            logger.warning(f"PCM too short for transcription: {len(pcm)} samples")
             return ""
-
         wav_path = UPLOAD_DIR / f"audio_{int(time.time())}.wav"
-        await write_pcm_to_wav(pcm_data, str(wav_path))
-
+        await write_pcm_to_wav(pcm.tobytes(), str(wav_path))
         recognizer = KaldiRecognizer(vosk_model, 16000)
         recognizer.SetWords(True)
         transcribed_text = ""
-
         async with aiofiles.open(wav_path, 'rb') as wf:
             while True:
                 data = await wf.read(4000)
@@ -152,12 +177,10 @@ async def process_audio(pcm_data: bytes) -> str:
                     transcribed_text += text
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing final Vosk result: {str(e)}")
-
         transcribed_text = transcribed_text.strip()
         logger.info(f"Transcription completed: {transcribed_text} in {time.time() - start_time:.3f}s")
         os.remove(wav_path)
         logger.info(f"Deleted WAV: {wav_path}")
-
         return transcribed_text
     except Exception as e:
         logger.error(f"Error processing PCM: {str(e)}")

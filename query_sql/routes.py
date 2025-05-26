@@ -2,7 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Body, WebSocket
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from typing import Dict
-from services import process_audio, text_to_speech, cleanup_old_audio_files
+from services import process_audio, text_to_speech, cleanup_old_audio_files, decode_base64_pcm, concatenate_chunks, verify_trailing_silence
 from file_handler import extract_text_from_file
 from chunker import chunk_text
 from embedder import embed_chunks, store_embeddings
@@ -16,6 +16,7 @@ import logging
 import psycopg2
 import shutil
 import json
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -141,98 +142,110 @@ async def clear_audio_files():
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection established for chat")
-    last_speech_time = time.time()  # Track last non-empty transcription
+    buffer = []
+    last_speech_time = time.time()
+    last_sequence = 0
     try:
         while True:
             data = await websocket.receive()
             if data["type"] == "websocket.disconnect":
                 logger.info("WebSocket disconnected")
                 break
-
-            if data["type"] == "websocket.receive" and "bytes" in data:
-                audio_chunk = data["bytes"]
-                logger.info(f"Received PCM of size: {len(audio_chunk)} bytes")
-                if not audio_chunk:
-                    logger.warning("Empty PCM received")
-                    continue
-
-                transcription = await process_audio(audio_chunk)
-                current_time = time.time()
-
-                if not transcription:
-                    # Only send "No speech detected" if 10 seconds have passed since last speech
-                    if current_time - last_speech_time >= 10:
+            if data["type"] == "websocket.receive" and "text" in data:
+                try:
+                    message = json.loads(data["text"])
+                    sequence = message['sequence']
+                    silence = message['silence']
+                    pcm = decode_base64_pcm(message['pcm'])
+                    logger.info(f"Received chunk: sequence={sequence}, silence={silence}, pcm_size={len(pcm)*2} bytes")
+                    if sequence < last_sequence:
+                        logger.warning(f"Out-of-order chunk: sequence={sequence}, expected>={last_sequence}")
+                        continue
+                    buffer.append({'sequence': sequence, 'pcm': pcm})
+                    if silence == 0 and buffer:
+                        concatenated_pcm = concatenate_chunks(buffer)
+                        if verify_trailing_silence(concatenated_pcm):
+                            transcription = await process_audio(concatenated_pcm)
+                            if transcription:
+                                last_speech_time = time.time()
+                                await websocket.send_json({
+                                    "type": "transcription",
+                                    "text": transcription,
+                                    "last_sequence": sequence
+                                })
+                                try:
+                                    with get_db() as conn:
+                                        cursor = conn.cursor()
+                                        query_embedding = embed_chunks([transcription])[0]
+                                        cursor.execute(
+                                            """
+                                            SELECT chunk_text, document_name, embedding <=> CAST(%s AS vector) AS cosine_distance
+                                            FROM chunks
+                                            ORDER BY embedding <=> CAST(%s AS vector)
+                                            LIMIT 5;
+                                            """,
+                                            (query_embedding, query_embedding)
+                                        )
+                                        results = cursor.fetchall()
+                                        top_chunks = [row["chunk_text"] for row in results]
+                                        chunk_metadata = [
+                                            {"text": row["chunk_text"], "document_name": row["document_name"], "cosine_distance": row["cosine_distance"]}
+                                            for row in results
+                                        ]
+                                    if not top_chunks:
+                                        logger.info("No relevant chunks found")
+                                        audio_filename = f"no_chunks_{int(time.time())}.wav"
+                                        audio_path = AUDIO_DIR / audio_filename
+                                        text_to_speech("No relevant chunks found in the database.", str(audio_path), "female")
+                                        audio_url = f"/audio/{audio_filename}"
+                                        cleanup_old_audio_files()
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "response": "No relevant chunks found",
+                                            "audio_url": audio_url
+                                        })
+                                    else:
+                                        logger.info(f"Retrieved {len(top_chunks)} chunks")
+                                        for meta in chunk_metadata:
+                                            logger.info(f"Chunk from {meta['document_name']}: {meta['text'][:50]}... (cosine distance: {meta['cosine_distance']:.4f})")
+                                        response = handle_query(transcription, top_chunks, chunk_metadata)
+                                        audio_filename = f"response_{int(time.time())}.wav"
+                                        audio_path = AUDIO_DIR / audio_filename
+                                        text_to_speech(response, str(audio_path), "female")
+                                        audio_url = f"/audio/{audio_filename}"
+                                        cleanup_old_audio_files()
+                                        await websocket.send_json({
+                                            "type": "response",
+                                            "response": response,
+                                            "audio_url": audio_url
+                                        })
+                                        logger.info(f"Query processed: {transcription}")
+                                    if transcription:
+                                        chunks = chunk_text(transcription)
+                                        embeddings = embed_chunks(chunks)
+                                        with get_db() as conn:
+                                            store_embeddings(chunks, embeddings, f"audio_{int(time.time())}.wav", conn)
+                                        logger.info(f"Stored {len(chunks)} chunks from transcription")
+                                except Exception as e:
+                                    logger.error(f"Error processing query: {str(e)}")
+                                    await websocket.send_json({"type": "error", "message": str(e)})
+                        buffer = []
+                        last_sequence = 0
+                    else:
+                        last_sequence = sequence + 1
+                    if time.time() - last_speech_time >= 10:
                         logger.info("No speech detected for 10 seconds")
+                        buffer = []
+                        last_sequence = 0
                         await websocket.send_json({
                             "type": "response",
-                            "response": "No speech detected",
+                            "response": "No speech detected from the user",
                             "audio_url": None
                         })
-                    continue
-
-                # Update last speech time on valid transcription
-                last_speech_time = current_time
-
-                try:
-                    with get_db() as conn:
-                        cursor = conn.cursor()
-                        query_embedding = embed_chunks([transcription])[0]
-                        cursor.execute(
-                            """
-                            SELECT chunk_text, document_name, embedding <=> CAST(%s AS vector) AS cosine_distance
-                            FROM chunks
-                            ORDER BY embedding <=> CAST(%s AS vector)
-                            LIMIT 5;
-                            """,
-                            (query_embedding, query_embedding)
-                        )
-                        results = cursor.fetchall()
-                        top_chunks = [row["chunk_text"] for row in results]
-                        chunk_metadata = [
-                            {"text": row["chunk_text"], "document_name": row["document_name"], "cosine_distance": row["cosine_distance"]}
-                            for row in results
-                        ]
-
-                    if not top_chunks:
-                        logger.info("No relevant chunks found")
-                        audio_filename = f"no_chunks_{int(time.time())}.wav"
-                        audio_path = AUDIO_DIR / audio_filename
-                        text_to_speech("No relevant chunks found in the database.", str(audio_path), "female")
-                        audio_url = f"/audio/{audio_filename}"
-                        cleanup_old_audio_files()
-                        await websocket.send_json({
-                            "type": "response",
-                            "response": "No relevant chunks found",
-                            "audio_url": audio_url
-                        })
-                    else:
-                        logger.info(f"Retrieved {len(top_chunks)} chunks")
-                        for meta in chunk_metadata:
-                            logger.info(f"Chunk from {meta['document_name']}: {meta['text'][:50]}... (cosine distance: {meta['cosine_distance']:.4f})")
-                        response = handle_query(transcription, top_chunks, chunk_metadata)
-                        audio_filename = f"response_{int(time.time())}.wav"
-                        audio_path = AUDIO_DIR / audio_filename
-                        text_to_speech(response, str(audio_path), "female")
-                        audio_url = f"/audio/{audio_filename}"
-                        cleanup_old_audio_files()
-                        await websocket.send_json({
-                            "type": "response",
-                            "response": response,
-                            "audio_url": audio_url
-                        })
-                        logger.info(f"Query processed: {transcription}")
-
-                    if transcription:
-                        chunks = chunk_text(transcription)
-                        embeddings = embed_chunks(chunks)
-                        with get_db() as conn:
-                            store_embeddings(chunks, embeddings, f"audio_{int(time.time())}.wav", conn)
-                        logger.info(f"Stored {len(chunks)} chunks from transcription")
-
+                        last_speech_time = time.time()
                 except Exception as e:
-                    logger.error(f"Error processing query: {str(e)}")
+                    logger.error(f"Error processing WebSocket message: {str(e)}")
                     await websocket.send_json({"type": "error", "message": str(e)})
-
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
         await websocket.send_json({"type": "error", "message": str(e)})
