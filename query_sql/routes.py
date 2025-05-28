@@ -145,6 +145,7 @@ async def websocket_chat(websocket: WebSocket):
     silence_count = 0
     min_chunks = 4          # Require 4 chunks (~2s) for transcription
     silence_threshold = 14.0  # RMS threshold for silence detection
+    min_rms = 5.0           # Minimum RMS to consider buffer for processing
 
     try:
         while True:
@@ -172,10 +173,17 @@ async def websocket_chat(websocket: WebSocket):
                     # Update silence count: increment if silent, reset if speech
                     silence_count = silence_count + 1 if silence == 0 else 0
 
-                    # Process buffer when we have at least 4 chunks and 2 consecutive silent chunks
+                    # Process buffer when we have at least 4 chunks, 2 consecutive silent chunks, and sufficient audio energy
                     if len(buffer) >= min_chunks and silence_count >= 2:
                         logger.info(f"Processing buffer: {len(buffer)} chunks, silence_count={silence_count}")
                         concatenated_pcm = concatenate_chunks(buffer)
+                        # Check overall RMS to ensure buffer contains speech
+                        overall_rms = np.sqrt(np.mean(concatenated_pcm.astype(np.float32)**2))
+                        if overall_rms < min_rms:
+                            logger.info(f"Buffer RMS too low: {overall_rms:.4f}, skipping transcription")
+                            buffer = []
+                            silence_count = 0
+                            continue
                         if verify_trailing_silence(concatenated_pcm, threshold=silence_threshold):
                             transcription = await process_audio(concatenated_pcm)
                             if transcription and transcription.strip():
@@ -208,13 +216,6 @@ async def websocket_chat(websocket: WebSocket):
                                         })
                                         logger.info(f"Sent audio chunk: sequence={i // chunk_size}, size={len(pcm_bytes)} bytes")
                                     logger.info(f"Query processed: {transcription}")
-                                    # Store transcription in database
-                                    chunks = chunk_text(transcription)
-                                    if chunks:
-                                        embeddings = embed_chunks(chunks)
-                                        with get_db() as conn:
-                                            store_embeddings(chunks, embeddings, f"audio_{int(time.time())}.wav", conn)
-                                        logger.info(f"Stored {len(chunks)} chunks from transcription")
                                 except Exception as e:
                                     logger.error(f"Error processing query: {str(e)}")
                                     await websocket.send_json({"type": "error", "message": str(e)})
@@ -228,5 +229,12 @@ async def websocket_chat(websocket: WebSocket):
         logger.error(f"WebSocket error: {str(e)}")
         await websocket.send_json({"type": "error", "message": str(e)})
     finally:
-        await websocket.close()
-        logger.info("WebSocket closed")
+        # Only close if the WebSocket is still open
+        if websocket.client_state == 1:  # WebSocketState.CONNECTED
+            try:
+                await websocket.close()
+                logger.info("WebSocket closed")
+            except Exception as e:
+                logger.error(f"Error closing WebSocket: {str(e)}")
+        else:
+            logger.info("WebSocket already closed")

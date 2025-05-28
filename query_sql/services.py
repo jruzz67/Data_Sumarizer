@@ -36,7 +36,13 @@ PIPER_MODELS = {
 def decode_base64_pcm(base64_str: str) -> np.ndarray:
     try:
         pcm_bytes = base64.b64decode(base64_str)
-        return np.frombuffer(pcm_bytes, dtype=np.int16)
+        pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        # Amplify audio to improve recognition
+        amplification_factor = 2.0
+        pcm = pcm * amplification_factor
+        pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
+        logger.info(f"Amplified PCM by {amplification_factor}x")
+        return pcm
     except Exception as e:
         logger.error(f"Error decoding base64 PCM: {str(e)}")
         raise
@@ -87,7 +93,7 @@ async def write_pcm_to_wav(pcm_data: bytes, output_path: str, sample_rate: int =
 async def process_audio(pcm: np.ndarray) -> str:
     try:
         start_time = time.time()
-        if len(pcm) < 32000:  # ~2s at 16kHz to ensure enough audio
+        if len(pcm) < 32000:  # ~2s at 16kHz
             logger.warning(f"PCM too short for transcription: {len(pcm)} samples")
             return ""
         wav_path = UPLOAD_DIR / f"audio_{int(time.time())}.wav"
@@ -97,7 +103,7 @@ async def process_audio(pcm: np.ndarray) -> str:
         transcribed_text = ""
         async with aiofiles.open(wav_path, 'rb') as wf:
             while True:
-                data = await wf.read(8000)  # Increased chunk size for better context
+                data = await wf.read(8000)
                 if not data:
                     break
                 if recognizer.AcceptWaveform(data):
