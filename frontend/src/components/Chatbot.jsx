@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { FaPhone, FaPhoneSlash, FaPlayCircle, FaPauseCircle } from 'react-icons/fa';
+import { FaPhone, FaPhoneSlash } from 'react-icons/fa';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
@@ -10,11 +10,12 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
   const processorRef = useRef(null);
-  const currentAudioRef = useRef(null);
-  const playingMessageIdRef = useRef(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const sequenceRef = useRef(0);
+  const audioBufferQueue = useRef([]);
+  const isPlayingRef = useRef(false);
+  const sequenceRef = useRef(0); // Keep incrementing across utterances
   const silenceCountRef = useRef(0);
+  const audioChunksRef = useRef({});
+  const currentSequence = useRef(0); // Track the next expected sequence for audio playback
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -25,10 +26,6 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
 
   useEffect(() => {
     return () => {
-      if (currentAudioRef.current) {
-        currentAudioRef.current.pause();
-        currentAudioRef.current = null;
-      }
       if (websocket && websocket.readyState === WebSocket.OPEN) {
         websocket.close();
         setWebsocket(null);
@@ -65,139 +62,127 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     return Math.sqrt(sum / float32Array.length);
   };
 
-  const handlePlayAudio = (audioUrl, messageId) => {
-    if (!audioUrl) return;
-    const fullAudioUrl = audioUrl.startsWith('http') ? audioUrl : `http://localhost:8000${audioUrl}`;
-    if (playingMessageIdRef.current === messageId && currentAudioRef.current) {
-      if (isPlaying) {
-        currentAudioRef.current.pause();
-        setIsPlaying(false);
-      } else {
-        currentAudioRef.current.play().catch((e) => {
-          console.error('Audio playback failed:', e);
-          setMessages((prev) => [
-            ...prev,
-            { role: 'assistant', content: 'Error playing audio: ' + e.message },
-          ]);
-        });
-        setIsPlaying(true);
-      }
-      return;
-    }
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-    }
-    const audio = new Audio(fullAudioUrl);
-    currentAudioRef.current = audio;
-    playingMessageIdRef.current = messageId;
-    setIsPlaying(true);
-    audio.oncanplay = () => {
-      audio.play().catch((e) => {
-        console.error('Audio playback failed:', e);
-        setMessages((prev) => [
-          ...prev,
-          { role: 'assistant', content: 'Error playing audio: ' + e.message },
-        ]);
-        currentAudioRef.current = null;
-        playingMessageIdRef.current = null;
-        setIsPlaying(false);
-      });
+  const playNextBuffer = () => {
+    if (audioBufferQueue.current.length === 0 || isPlayingRef.current) return;
+    const buffer = audioBufferQueue.current.shift();
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContextRef.current.destination);
+    source.onended = () => {
+      isPlayingRef.current = false;
+      console.log(`[${new Date().toISOString()}] Audio buffer playback ended`);
+      playNextBuffer();
     };
-    audio.onended = () => {
-      currentAudioRef.current = null;
-      playingMessageIdRef.current = null;
-      setIsPlaying(false);
-    };
-    audio.onerror = () => {
-      console.error('Audio loading error');
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: 'Error loading audio' },
-      ]);
-      currentAudioRef.current = null;
-      playingMessageIdRef.current = null;
-      setIsPlaying(false);
-    };
-    audio.load();
+    source.start();
+    isPlayingRef.current = true;
+    console.log(`[${new Date().toISOString()}] Playing audio buffer: duration=${buffer.duration}s`);
   };
 
-  useEffect(() => {
-    const lastMessage = messages[messages.length - 1];
-    if (lastMessage && lastMessage.role === 'assistant' && lastMessage.audioUrl && playingMessageIdRef.current !== messages.length - 1) {
-      handlePlayAudio(lastMessage.audioUrl, messages.length - 1);
+  const handleAudioChunk = (sequence, pcmBase64) => {
+    try {
+      const pcmBytes = atob(pcmBase64);
+      const pcmArray = new Int16Array(pcmBytes.length / 2);
+      for (let i = 0; i < pcmBytes.length; i += 2) {
+        pcmArray[i / 2] = (pcmBytes.charCodeAt(i) & 0xff) | (pcmBytes.charCodeAt(i + 1) << 8);
+      }
+      console.log(`Received chunk: sequence=${sequence}, size=${pcmArray.length} samples`);
+      audioChunksRef.current[sequence] = pcmArray;
+      // Process chunks in order starting from currentSequence
+      while (audioChunksRef.current[currentSequence.current]) {
+        const pcm = audioChunksRef.current[currentSequence.current];
+        const float32Array = new Float32Array(pcm.length);
+        for (let i = 0; i < pcm.length; i++) {
+          float32Array[i] = pcm[i] / 32768.0;
+        }
+        const audioBuffer = audioContextRef.current.createBuffer(1, pcm.length, 16000);
+        audioBuffer.getChannelData(0).set(float32Array);
+        audioBufferQueue.current.push(audioBuffer);
+        delete audioChunksRef.current[currentSequence.current];
+        currentSequence.current++;
+      }
+      playNextBuffer();
+    } catch (e) {
+      console.error('Error processing audio chunk:', e);
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Error processing audio chunk' },
+      ]);
     }
-  }, [messages]);
+  };
 
   const handleStartCall = async () => {
     if (isInCall) return;
     setIsInCall(true);
-    const ws = new WebSocket('ws://localhost:8000/ws/chat');
-    ws.onopen = () => {
-      console.log('WebSocket connection established');
-      setWebsocket(ws);
-    };
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'transcription') {
+    try {
+      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
+      console.log('AudioContext initialized');
+
+      const ws = new WebSocket('ws://localhost:8000/ws/chat');
+      ws.onopen = () => {
+        console.log('WebSocket connection established');
+        setWebsocket(ws);
+      };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'transcription') {
+            setMessages((prev) => [
+              ...prev,
+              { role: 'user', content: data.text || 'No transcription received' },
+            ]);
+          } else if (data.type === 'response') {
+            setMessages((prev) => [
+              ...prev,
+              { role: 'assistant', content: data.response || 'No response received' },
+            ]);
+            // Reset currentSequence for new response
+            currentSequence.current = 0;
+            audioChunksRef.current = {};
+            audioBufferQueue.current = [];
+          } else if (data.type === 'audio_chunk') {
+            handleAudioChunk(data.sequence, data.pcm);
+          } else if (data.type === 'error') {
+            setMessages((prev) => [
+              ...prev,
+              { role: 'assistant', content: `Error: ${data.message}` },
+            ]);
+          }
+        } catch (e) {
+          console.error('Error parsing WebSocket message:', e);
           setMessages((prev) => [
             ...prev,
-            { role: 'user', content: data.text || 'No transcription received' },
-          ]);
-        } else if (data.type === 'response') {
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: 'assistant',
-              content: data.response || 'No response received',
-              audioUrl: data.audio_url,
-            },
-          ]);
-        } else if (data.type === 'error') {
-          setMessages((prev) => [
-            ...prev,
-            { role: 'assistant', content: 'Error: ' + data.message },
+            { role: 'assistant', content: 'Error processing message' },
           ]);
         }
-      } catch (e) {
-        console.error('Error parsing WebSocket message:', e);
+      };
+      ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: 'Error processing message' },
+          { role: 'assistant', content: `WebSocket error: ${error.message || 'Connection failed'}` },
         ]);
-      }
-    };
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: 'WebSocket error' },
-      ]);
-      setIsInCall(false);
-    };
-    ws.onclose = () => {
-      console.log('WebSocket closed');
-      setWebsocket(null);
-      setIsInCall(false);
-      if (processorRef.current) {
-        processorRef.current.disconnect();
-        processorRef.current = null;
-      }
-    };
-    try {
+        setIsInCall(false);
+      };
+      ws.onclose = () => {
+        console.log('WebSocket closed');
+        setWebsocket(null);
+        setIsInCall(false);
+        if (processorRef.current) {
+          processorRef.current.disconnect();
+          processorRef.current = null;
+        }
+      };
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true },
       });
       streamRef.current = stream;
-      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
       const source = audioContextRef.current.createMediaStreamSource(stream);
       const processor = audioContextRef.current.createScriptProcessor(8192, 1, 1);
       processorRef.current = processor;
       source.connect(processor);
       processor.connect(audioContextRef.current.destination);
       const silenceThreshold = 0.005;
-      const silenceChunksRequired = 1; // ~512ms silence
+      const silenceChunksRequired = 2; // ~1s silence
       processor.onaudioprocess = (event) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const input = event.inputBuffer.getChannelData(0);
@@ -215,18 +200,21 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
         });
         ws.send(message);
         console.log(`[${new Date().toISOString()}] Sent chunk: sequence=${sequenceRef.current}, silence=${silenceFlag}`);
-        sequenceRef.current++;
-        if (silenceFlag === 0) sequenceRef.current = 0;
+        sequenceRef.current++; // Increment sequence number for each chunk
       };
       console.log('Call started, streaming audio chunks');
     } catch (error) {
       console.error('Error starting call:', error);
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: 'Error accessing microphone: ' + error.message },
+        { role: 'assistant', content: `Error accessing microphone: ${error.message}` },
       ]);
       setIsInCall(false);
-      if (ws) ws.close();
+      if (websocket) websocket.close();
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
     }
   };
 
@@ -251,6 +239,9 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     }
     sequenceRef.current = 0;
     silenceCountRef.current = 0;
+    audioBufferQueue.current = [];
+    audioChunksRef.current = {};
+    isPlayingRef.current = false;
     console.log('Call ended');
   };
 
@@ -285,22 +276,6 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
                 style={{ wordBreak: 'break-word' }}
               >
                 {msg.content}
-                {msg.audioUrl && msg.role === 'assistant' && (
-                  <motion.button
-                    onClick={() => handlePlayAudio(msg.audioUrl, index)}
-                    className="mt-2 flex items-center text-cyan-400 hover:text-cyan-300"
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    aria-label={playingMessageIdRef.current === index && isPlaying ? 'Pause Audio' : 'Play Audio'}
-                  >
-                    {playingMessageIdRef.current === index && isPlaying ? (
-                      <FaPauseCircle className="mr-1" />
-                    ) : (
-                      <FaPlayCircle className="mr-1" />
-                    )}
-                    {playingMessageIdRef.current === index && isPlaying ? 'Pause' : 'Play'}
-                  </motion.button>
-                )}
               </div>
             </motion.div>
           ))}

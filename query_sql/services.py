@@ -10,6 +10,7 @@ from vosk import Model, KaldiRecognizer
 import aiofiles
 import base64
 import subprocess
+import librosa
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,11 @@ def verify_trailing_silence(pcm: np.ndarray, sample_rate: int = 16000, silence_d
         if len(pcm) < samples_to_check:
             logger.warning(f"PCM too short for silence verification: {len(pcm)} samples")
             return False
-        trailing_samples = pcm[-samples_to_check:]
+        trailing_samples = pcm[-samples_to_check:].astype(np.float32)
         rms = np.sqrt(np.mean(trailing_samples**2))
+        if np.isnan(rms):
+            logger.warning("RMS calculation resulted in NaN")
+            return False
         logger.info(f"Trailing RMS: {rms:.4f}, threshold: {threshold}")
         return rms < threshold
     except Exception as e:
@@ -83,17 +87,17 @@ async def write_pcm_to_wav(pcm_data: bytes, output_path: str, sample_rate: int =
 async def process_audio(pcm: np.ndarray) -> str:
     try:
         start_time = time.time()
-        if len(pcm) < 16000:  # ~1s at 16kHz
+        if len(pcm) < 32000:  # ~2s at 16kHz to ensure enough audio
             logger.warning(f"PCM too short for transcription: {len(pcm)} samples")
             return ""
         wav_path = UPLOAD_DIR / f"audio_{int(time.time())}.wav"
         await write_pcm_to_wav(pcm.tobytes(), str(wav_path))
-        recognizer = KaldiRecognizer(vosk_model, 16000)
+        recognizer = KaldiRecognizer(vosk_model, 16000, '{"beam": 20}')
         recognizer.SetWords(True)
         transcribed_text = ""
         async with aiofiles.open(wav_path, 'rb') as wf:
             while True:
-                data = await wf.read(4000)
+                data = await wf.read(8000)  # Increased chunk size for better context
                 if not data:
                     break
                 if recognizer.AcceptWaveform(data):
@@ -131,7 +135,7 @@ async def process_audio(pcm: np.ndarray) -> str:
             logger.info(f"Cleaned up WAV: {wav_path}")
         return ""
 
-def text_to_speech(text: str, output_path: str, voice_model: str = "female") -> None:
+def text_to_speech(text: str, voice_model: str = "female") -> np.ndarray:
     try:
         start_time = time.time()
         logger.info(f"Using voice model: {voice_model}")
@@ -143,29 +147,38 @@ def text_to_speech(text: str, output_path: str, voice_model: str = "female") -> 
             logger.error(f"Piper binary not found at {PIPER_BINARY}")
             raise FileNotFoundError(f"Piper binary not found at {PIPER_BINARY}")
         logger.info(f"Generating TTS with model: {model_path}")
-        subprocess.run(
-            [PIPER_BINARY, "--model", model_path, "--output_file", output_path],
+        # Create a temporary WAV file
+        temp_wav = AUDIO_DIR / f"temp_tts_{int(time.time())}.wav"
+        process = subprocess.run(
+            [PIPER_BINARY, "--model", model_path, "--output_file", str(temp_wav)],
             input=text.encode(),
             check=True,
             capture_output=True
         )
-        logger.info(f"Generated speech saved to {output_path} in {time.time() - start_time:.3f}s")
+        # Load and resample WAV using librosa
+        audio, sr = librosa.load(str(temp_wav), sr=16000, mono=True)
+        logger.info(f"Loaded WAV: sample_rate={sr}, channels=1, min={audio.min()}, max={audio.max()}")
+        # Normalize audio to [-1.0, 1.0] if necessary
+        if np.max(np.abs(audio)) > 1.0:
+            audio = audio / np.max(np.abs(audio))
+            logger.info("Normalized audio to prevent clipping")
+        # Convert to 16-bit PCM
+        pcm_data = (audio * 32767).astype(np.int16)
+        # Save PCM data to a WAV file for debugging
+        debug_pcm_wav = AUDIO_DIR / f"debug_pcm_{int(time.time())}.wav"
+        with wave.open(str(debug_pcm_wav), 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(pcm_data.tobytes())
+        logger.info(f"Saved debug PCM WAV: {debug_pcm_wav}")
+        # Clean up temporary file
+        os.remove(temp_wav)
+        logger.info(f"Generated PCM data in {time.time() - start_time:.3f}s")
+        return pcm_data
     except subprocess.CalledProcessError as e:
         logger.error(f"Piper TTS failed: {e.stderr.decode()}")
         raise
     except Exception as e:
         logger.error(f"Error in text-to-speech: {str(e)}")
         raise
-
-def cleanup_old_audio_files(max_age_seconds=3600):
-    try:
-        start_time = time.time()
-        current_time = time.time()
-        for audio_file in AUDIO_DIR.glob("*.wav"):
-            file_age = current_time - os.path.getmtime(audio_file)
-            if file_age > max_age_seconds:
-                os.remove(audio_file)
-                logger.info(f"Deleted old audio file: {audio_file}")
-        logger.info(f"Cleanup completed in {time.time() - start_time:.3f}s")
-    except Exception as e:
-        logger.error(f"Error cleaning up audio files: {str(e)}")

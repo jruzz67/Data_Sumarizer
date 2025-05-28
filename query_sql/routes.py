@@ -1,8 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Body, WebSocket
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict
-from services import process_audio, text_to_speech, cleanup_old_audio_files, decode_base64_pcm, concatenate_chunks, verify_trailing_silence
+from services import process_audio, text_to_speech, decode_base64_pcm, concatenate_chunks, verify_trailing_silence
 from file_handler import extract_text_from_file
 from chunker import chunk_text, search_top_chunks
 from embedder import embed_chunks, store_embeddings
@@ -17,6 +17,7 @@ import psycopg2
 import shutil
 import json
 import base64
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class ClearResponse(BaseModel):
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)):
+    """Upload a file and store it in the uploads directory."""
     allowed_extensions = {".pdf", ".txt", ".xlsx", ".xls"}
     file_ext = os.path.splitext(file.filename)[1].lower()
     if file_ext not in allowed_extensions:
@@ -56,7 +58,7 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        logger.info(f"File uploaded successfully: {file.filename}")
+        logger.info(f"File uploaded: {file.filename}")
         return UploadResponse(filename=file.filename, message="File uploaded successfully")
     except Exception as e:
         logger.error(f"Error uploading file {file.filename}: {str(e)}")
@@ -64,63 +66,57 @@ async def upload_file(file: UploadFile = File(...)):
 
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_file(request: Dict[str, str] = Body(...)):
+    """Analyze an uploaded file, extract text, chunk it, and store embeddings."""
     filename = request.get("filename")
     if not filename:
         logger.warning("Analyze request missing filename")
         raise HTTPException(status_code=400, detail="Filename is required")
     file_path = UPLOAD_DIR / filename
     if not file_path.exists():
-        logger.warning(f"File not found for analysis: {filename}")
+        logger.warning(f"File not found: {filename}")
         raise HTTPException(status_code=404, detail="File not found")
     try:
         text = extract_text_from_file(str(file_path))
         if not text:
-            logger.warning(f"No text extracted from file: {filename}")
+            logger.warning(f"No text extracted from: {filename}")
             raise HTTPException(status_code=400, detail="No text extracted from file")
         chunks = chunk_text(text)
         if not chunks:
-            logger.warning(f"No chunks generated for file: {filename}")
-            raise HTTPException(status_code=400, detail="No chunks generated")
+            logger.warning(f"No chunks created for: {filename}")
+            raise HTTPException(status_code=400, detail="No chunks created")
         embeddings = embed_chunks(chunks)
         try:
             with get_db() as conn:
                 store_embeddings(chunks, embeddings, filename, conn)
         except psycopg2.Error as e:
-            logger.error(f"Database error while storing embeddings for {filename}: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+            logger.error(f"Error saving embeddings for {filename}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error saving to database: {str(e)}")
         try:
             delete_file(str(file_path))
         except Exception as e:
             logger.warning(f"Failed to delete file {filename}: {str(e)}")
-        logger.info(f"File analyzed successfully: {filename}, chunks: {len(chunks)}")
+        logger.info(f"File analyzed: {filename}, {len(chunks)} chunks")
         return AnalyzeResponse(
             filename=filename,
             chunk_count=len(chunks),
-            message="File analyzed and embeddings stored"
+            message="File analyzed, embeddings stored"
         )
     except Exception as e:
-        logger.error(f"Error analyzing file {filename}: {str(e)}")
+        logger.error(f"Error analyzing {filename}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error analyzing file: {str(e)}")
-
-@router.get("/audio/{filename}")
-async def get_audio(filename: str):
-    audio_path = AUDIO_DIR / filename
-    if not audio_path.exists():
-        logger.warning(f"Audio file not found: {filename}")
-        raise HTTPException(status_code=404, detail="Audio file not found")
-    return FileResponse(audio_path, media_type="audio/wav", headers={"Access-Control-Allow-Origin": "*"})
 
 @router.post("/clear", response_model=ClearResponse)
 async def clear_data():
+    """Clear all data from the chunks table."""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("TRUNCATE TABLE chunks;")
             conn.commit()
-            logger.info("Database table 'chunks' truncated successfully")
+            logger.info("Table 'chunks' cleared")
         return ClearResponse(message="Database cleared successfully")
     except psycopg2.Error as e:
-        logger.error(f"Database error while clearing data: {str(e)}")
+        logger.error(f"Database error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
         logger.error(f"Error clearing data: {str(e)}")
@@ -128,24 +124,28 @@ async def clear_data():
 
 @router.post("/clear_audio", response_model=ClearResponse)
 async def clear_audio_files():
+    """Delete all WAV files in audio directory."""
     try:
         for audio_file in AUDIO_DIR.glob("*.wav"):
             os.remove(audio_file)
-            logger.info(f"Deleted audio file: {audio_file}")
-        logger.info("All audio files cleared successfully")
+            logger.info(f"Deleted: {audio_file}")
+        logger.info("Audio files cleared")
         return ClearResponse(message="Audio files cleared successfully")
     except Exception as e:
-        logger.error(f"Error clearing audio files: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error clearing audio files: {str(e)}")
+        logger.error(f"Error clearing audio: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error clearing audio: {str(e)}")
 
 @router.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
+    """Handle WebSocket for real-time audio chat."""
     await websocket.accept()
-    logger.info("WebSocket connection established for chat")
+    logger.info("WebSocket connection established")
     buffer = []
-    last_speech_time = time.time()
     last_sequence = 0
-    waiting_for_playback = False
+    silence_count = 0
+    min_chunks = 4          # Require 4 chunks (~2s) for transcription
+    silence_threshold = 14.0  # RMS threshold for silence detection
+
     try:
         while True:
             data = await websocket.receive()
@@ -155,58 +155,62 @@ async def websocket_chat(websocket: WebSocket):
             if data["type"] == "websocket.receive" and "text" in data:
                 try:
                     message = json.loads(data["text"])
-                    message_type = message.get('type')
-                    # Handle audio playback completion
-                    if message_type == 'audio_playback_finished':
-                        logger.info("Received audio playback finished message")
-                        waiting_for_playback = False
-                        last_speech_time = time.time()
-                        continue
-                    # Handle audio chunk
                     sequence = message.get('sequence')
-                    silence = message.get('silence')
+                    silence = message['silence']
                     pcm = decode_base64_pcm(message['pcm'])
+
                     # Validate sequence
                     if not isinstance(sequence, int):
-                        logger.warning(f"Invalid sequence value: {sequence}, skipping message")
+                        logger.warning(f"Invalid sequence: {sequence}, skipping")
                         continue
                     logger.info(f"Received chunk: sequence={sequence}, silence={silence}, pcm_size={len(pcm)*2} bytes")
                     if sequence < last_sequence:
                         logger.warning(f"Out-of-order chunk: sequence={sequence}, expected>={last_sequence}")
                         continue
+
                     buffer.append({'sequence': sequence, 'pcm': pcm})
-                    if silence == 0 and buffer:
+                    # Update silence count: increment if silent, reset if speech
+                    silence_count = silence_count + 1 if silence == 0 else 0
+
+                    # Process buffer when we have at least 4 chunks and 2 consecutive silent chunks
+                    if len(buffer) >= min_chunks and silence_count >= 2:
+                        logger.info(f"Processing buffer: {len(buffer)} chunks, silence_count={silence_count}")
                         concatenated_pcm = concatenate_chunks(buffer)
-                        if verify_trailing_silence(concatenated_pcm):
+                        if verify_trailing_silence(concatenated_pcm, threshold=silence_threshold):
                             transcription = await process_audio(concatenated_pcm)
-                            if transcription:
-                                last_speech_time = time.time()
+                            if transcription and transcription.strip():
                                 await websocket.send_json({
                                     "type": "transcription",
                                     "text": transcription,
                                     "last_sequence": sequence
                                 })
                                 try:
-                                    # Retrieve top chunks for the query
+                                    # Retrieve top chunks for query
                                     top_chunks, chunk_metadata = search_top_chunks(transcription)
-                                    # Process query with retrieved chunks or empty lists if none found
+                                    # Process query
                                     response = handle_query(transcription, top_chunks, chunk_metadata)
-                                    # Generate audio response
-                                    audio_filename = f"response_{int(time.time())}.wav"
-                                    audio_path = AUDIO_DIR / audio_filename
-                                    text_to_speech(response, str(audio_path), "female")
-                                    audio_url = f"/audio/{audio_filename}"
-                                    cleanup_old_audio_files()
+                                    # Send response text
                                     await websocket.send_json({
                                         "type": "response",
-                                        "response": response,
-                                        "audio_url": audio_url
+                                        "response": response
                                     })
+                                    # Generate and stream audio response
+                                    pcm_data = text_to_speech(response, "female")
+                                    chunk_size = 8192
+                                    for i in range(0, len(pcm_data), chunk_size):
+                                        chunk = pcm_data[i:i + chunk_size]
+                                        pcm_bytes = chunk.tobytes()
+                                        pcm_base64 = base64.b64encode(pcm_bytes).decode('utf-8')
+                                        await websocket.send_json({
+                                            "type": "audio_chunk",
+                                            "sequence": i // chunk_size,
+                                            "pcm": pcm_base64
+                                        })
+                                        logger.info(f"Sent audio chunk: sequence={i // chunk_size}, size={len(pcm_bytes)} bytes")
                                     logger.info(f"Query processed: {transcription}")
-                                    waiting_for_playback = True  # Wait for playback to finish
                                     # Store transcription in database
                                     chunks = chunk_text(transcription)
-                                    if chunks:  # Only store if chunks exist
+                                    if chunks:
                                         embeddings = embed_chunks(chunks)
                                         with get_db() as conn:
                                             store_embeddings(chunks, embeddings, f"audio_{int(time.time())}.wav", conn)
@@ -215,32 +219,14 @@ async def websocket_chat(websocket: WebSocket):
                                     logger.error(f"Error processing query: {str(e)}")
                                     await websocket.send_json({"type": "error", "message": str(e)})
                         buffer = []
-                        last_sequence = 0
-                    else:
-                        last_sequence = sequence + 1
-                    # Check for silence only if not waiting for playback
-                    if not waiting_for_playback and time.time() - last_speech_time >= 10:
-                        logger.info("No speech detected for 10 seconds")
-                        buffer = []
-                        last_sequence = 0
-                        response = "No speech detected from the user"
-                        audio_filename = f"no_speech_{int(time.time())}.wav"
-                        audio_path = AUDIO_DIR / audio_filename
-                        text_to_speech(response, str(audio_path), "female")
-                        audio_url = f"/audio/{audio_filename}"
-                        cleanup_old_audio_files()
-                        await websocket.send_json({
-                            "type": "response",
-                            "response": response,
-                            "audio_url": audio_url
-                        })
-                        waiting_for_playback = True  # Wait for "no speech" audio to finish
-                        last_speech_time = time.time()
+                        silence_count = 0
+                    last_sequence = sequence
                 except Exception as e:
-                    logger.error(f"Error processing WebSocket message: {str(e)}")
+                    logger.error(f"Error processing message: {str(e)}")
                     await websocket.send_json({"type": "error", "message": str(e)})
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
         await websocket.send_json({"type": "error", "message": str(e)})
+    finally:
         await websocket.close()
-        logger.info("WebSocket connection closed")
+        logger.info("WebSocket closed")
