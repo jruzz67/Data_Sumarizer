@@ -205,7 +205,7 @@ const DocumentPanel = ({ isOpen, onClose }) => {
           </div>
 
           <div
-            className="mt-4 text-sm flex-grow overflow-y-auto"
+            className="mt-4 text-sm flex-grow overflow-y-auto hide-scrollbar"
             style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
           >
             <style>
@@ -215,7 +215,7 @@ const DocumentPanel = ({ isOpen, onClose }) => {
                 }
               `}
             </style>
-            <AnimatePresence mode="wait">
+            <AnimatePresence>
               {uploadStatus && (
                 <motion.p
                   key="uploadStatus"

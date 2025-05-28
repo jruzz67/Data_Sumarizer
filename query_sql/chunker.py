@@ -13,11 +13,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("__name__")
 
-def chunk_text(text: str, max_chunk_size: int = None) -> list:
+def chunk_text(text: str, max_chunk_size: int = 512) -> list:
     """
     Split text into chunks of specified size.
     Returns a list of text chunks.
     
+    Args:
+        text (str): The input text to chunk.
+        max_chunk_size (int, optional): Maximum size of each chunk in characters. Defaults to 512.
     """
     # Type checking
     if not isinstance(text, str):
@@ -25,6 +28,11 @@ def chunk_text(text: str, max_chunk_size: int = None) -> list:
 
     if not text:
         return []
+
+    # Validate max_chunk_size
+    if not isinstance(max_chunk_size, int) or max_chunk_size <= 0:
+        logger.warning(f"Invalid max_chunk_size: {max_chunk_size}, using default 512")
+        max_chunk_size = 512
 
     words = text.split()
     chunks = []
@@ -36,15 +44,16 @@ def chunk_text(text: str, max_chunk_size: int = None) -> list:
         if current_length + word_length <= max_chunk_size:
             current_chunk.append(word)
             current_length += word_length
-        
         else:
-            chunks.append(" ".join(current_chunk))
+            if current_chunk:  # Only append if there's content
+                chunks.append(" ".join(current_chunk))
             current_chunk = [word]
             current_length = word_length
 
     if current_chunk:
         chunks.append(" ".join(current_chunk))
 
+    logger.info(f"Generated {len(chunks)} chunks from text of length {len(text)}")
     return chunks
 
 def search_top_chunks(query_text: str, top_k: int = 5) -> tuple[list, list]:

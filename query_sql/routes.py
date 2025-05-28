@@ -145,6 +145,7 @@ async def websocket_chat(websocket: WebSocket):
     buffer = []
     last_speech_time = time.time()
     last_sequence = 0
+    waiting_for_playback = False
     try:
         while True:
             data = await websocket.receive()
@@ -154,9 +155,21 @@ async def websocket_chat(websocket: WebSocket):
             if data["type"] == "websocket.receive" and "text" in data:
                 try:
                     message = json.loads(data["text"])
-                    sequence = message['sequence']
-                    silence = message['silence']
+                    message_type = message.get('type')
+                    # Handle audio playback completion
+                    if message_type == 'audio_playback_finished':
+                        logger.info("Received audio playback finished message")
+                        waiting_for_playback = False
+                        last_speech_time = time.time()
+                        continue
+                    # Handle audio chunk
+                    sequence = message.get('sequence')
+                    silence = message.get('silence')
                     pcm = decode_base64_pcm(message['pcm'])
+                    # Validate sequence
+                    if not isinstance(sequence, int):
+                        logger.warning(f"Invalid sequence value: {sequence}, skipping message")
+                        continue
                     logger.info(f"Received chunk: sequence={sequence}, silence={silence}, pcm_size={len(pcm)*2} bytes")
                     if sequence < last_sequence:
                         logger.warning(f"Out-of-order chunk: sequence={sequence}, expected>={last_sequence}")
@@ -190,12 +203,14 @@ async def websocket_chat(websocket: WebSocket):
                                         "audio_url": audio_url
                                     })
                                     logger.info(f"Query processed: {transcription}")
+                                    waiting_for_playback = True  # Wait for playback to finish
                                     # Store transcription in database
                                     chunks = chunk_text(transcription)
-                                    embeddings = embed_chunks(chunks)
-                                    with get_db() as conn:
-                                        store_embeddings(chunks, embeddings, f"audio_{int(time.time())}.wav", conn)
-                                    logger.info(f"Stored {len(chunks)} chunks from transcription")
+                                    if chunks:  # Only store if chunks exist
+                                        embeddings = embed_chunks(chunks)
+                                        with get_db() as conn:
+                                            store_embeddings(chunks, embeddings, f"audio_{int(time.time())}.wav", conn)
+                                        logger.info(f"Stored {len(chunks)} chunks from transcription")
                                 except Exception as e:
                                     logger.error(f"Error processing query: {str(e)}")
                                     await websocket.send_json({"type": "error", "message": str(e)})
@@ -203,7 +218,8 @@ async def websocket_chat(websocket: WebSocket):
                         last_sequence = 0
                     else:
                         last_sequence = sequence + 1
-                    if time.time() - last_speech_time >= 10:
+                    # Check for silence only if not waiting for playback
+                    if not waiting_for_playback and time.time() - last_speech_time >= 10:
                         logger.info("No speech detected for 10 seconds")
                         buffer = []
                         last_sequence = 0
@@ -218,6 +234,7 @@ async def websocket_chat(websocket: WebSocket):
                             "response": response,
                             "audio_url": audio_url
                         })
+                        waiting_for_playback = True  # Wait for "no speech" audio to finish
                         last_speech_time = time.time()
                 except Exception as e:
                     logger.error(f"Error processing WebSocket message: {str(e)}")
