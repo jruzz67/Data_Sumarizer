@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Dict
 from services import process_audio, text_to_speech, cleanup_old_audio_files, decode_base64_pcm, concatenate_chunks, verify_trailing_silence
 from file_handler import extract_text_from_file
-from chunker import chunk_text
+from chunker import chunk_text, search_top_chunks
 from embedder import embed_chunks, store_embeddings
 from query_handler import handle_query
 from utils import delete_file
@@ -174,8 +174,10 @@ async def websocket_chat(websocket: WebSocket):
                                     "last_sequence": sequence
                                 })
                                 try:
-                                    # Process query
-                                    response = handle_query(transcription, [], [])
+                                    # Retrieve top chunks for the query
+                                    top_chunks, chunk_metadata = search_top_chunks(transcription)
+                                    # Process query with retrieved chunks or empty lists if none found
+                                    response = handle_query(transcription, top_chunks, chunk_metadata)
                                     # Generate audio response
                                     audio_filename = f"response_{int(time.time())}.wav"
                                     audio_path = AUDIO_DIR / audio_filename
