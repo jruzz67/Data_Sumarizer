@@ -2,6 +2,30 @@ import { useState, useEffect, useRef } from 'react';
 import { FaPhone, FaPhoneSlash } from 'react-icons/fa';
 import { motion, AnimatePresence } from 'framer-motion';
 
+// MULAW encoding/decoding functions
+const linearToMulaw = (sample) => {
+  const MULAW_BIAS = 132;
+  const MULAW_MAX = 32635;
+  sample = Math.min(Math.max(sample, -MULAW_MAX), MULAW_MAX);
+  const sign = sample < 0 ? 0x80 : 0x00;
+  sample = Math.abs(sample);
+  const exponent = Math.floor(Math.log2((sample + MULAW_BIAS) / MULAW_BIAS));
+  const mantissa = Math.round((sample / Math.pow(2, exponent) - 1) * 16);
+  let mulaw = sign | ((exponent & 0x07) << 4) | (mantissa & 0x0F);
+  mulaw = mulaw ^ 0xFF; // Invert bits for MULAW
+  return mulaw;
+};
+
+const mulawToLinear = (mulaw) => {
+  const MULAW_BIAS = 132;
+  mulaw = mulaw ^ 0xFF; // Invert bits for MULAW
+  const sign = mulaw & 0x80 ? -1 : 1;
+  const exponent = (mulaw >> 4) & 0x07;
+  const mantissa = mulaw & 0x0F;
+  const magnitude = (Math.pow(2, exponent) * (16 + mantissa) - 16 + MULAW_BIAS) * Math.pow(2, exponent);
+  return sign * magnitude;
+};
+
 const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
   const [messages, setMessages] = useState([]);
   const [isInCall, setIsInCall] = useState(false);
@@ -62,6 +86,20 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     return Math.sqrt(sum / float32Array.length);
   };
 
+  const resampleAudio = (inputBuffer, sourceSampleRate, targetSampleRate) => {
+    const ratio = sourceSampleRate / targetSampleRate;
+    const inputData = inputBuffer.getChannelData(0);
+    const outputLength = Math.floor(inputData.length / ratio);
+    const outputData = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i++) {
+      const srcIndex = Math.floor(i * ratio);
+      outputData[i] = inputData[srcIndex];
+    }
+    const outputBuffer = audioContextRef.current.createBuffer(1, outputLength, targetSampleRate);
+    outputBuffer.getChannelData(0).set(outputData);
+    return outputBuffer;
+  };
+
   const playNextBuffer = () => {
     if (audioBufferQueue.current.length === 0 || isPlayingRef.current) return;
     const buffer = audioBufferQueue.current.shift();
@@ -78,23 +116,22 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     console.log(`[${new Date().toISOString()}] Playing audio buffer: duration=${buffer.duration}s`);
   };
 
-  const handleAudioChunk = (sequence, pcmBase64) => {
+  const handleAudioChunk = (sequence, mulawBase64) => {
     try {
-      const pcmBytes = atob(pcmBase64);
-      const pcmArray = new Int16Array(pcmBytes.length / 2);
-      for (let i = 0; i < pcmBytes.length; i += 2) {
-        pcmArray[i / 2] = (pcmBytes.charCodeAt(i) & 0xff) | (pcmBytes.charCodeAt(i + 1) << 8);
+      const mulawBytes = atob(mulawBase64);
+      const pcmArray = new Int16Array(mulawBytes.length);
+      for (let i = 0; i < mulawBytes.length; i++) {
+        pcmArray[i] = mulawToLinear(mulawBytes.charCodeAt(i));
       }
-      console.log(`Received chunk: sequence=${sequence}, size=${pcmArray.length} samples`);
+      console.log(`Received MULAW chunk: sequence=${sequence}, size=${pcmArray.length} samples`);
       audioChunksRef.current[sequence] = pcmArray;
-      // Process chunks in order starting from currentSequence
       while (audioChunksRef.current[currentSequence.current]) {
         const pcm = audioChunksRef.current[currentSequence.current];
         const float32Array = new Float32Array(pcm.length);
         for (let i = 0; i < pcm.length; i++) {
           float32Array[i] = pcm[i] / 32768.0;
         }
-        const audioBuffer = audioContextRef.current.createBuffer(1, pcm.length, 16000);
+        const audioBuffer = audioContextRef.current.createBuffer(1, pcm.length, 8000);
         audioBuffer.getChannelData(0).set(float32Array);
         audioBufferQueue.current.push(audioBuffer);
         delete audioChunksRef.current[currentSequence.current];
@@ -115,9 +152,9 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
     setIsInCall(true);
     try {
       audioContextRef.current = new AudioContext({ sampleRate: 16000 });
-      console.log('AudioContext initialized');
+      console.log('AudioContext initialized at 16000 Hz');
 
-      const ws = new WebSocket('ws://localhost:8000/ws/chat');
+      const ws = new WebSocket('ws://localhost:8000/ws');
       ws.onopen = () => {
         console.log('WebSocket connection established');
         setWebsocket(ws);
@@ -135,7 +172,6 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
               ...prev,
               { role: 'assistant', content: data.response || 'No response received' },
             ]);
-            // Reset currentSequence for new response
             currentSequence.current = 0;
             audioChunksRef.current = {};
             audioBufferQueue.current = [];
@@ -177,32 +213,46 @@ const Chatbot = ({ isPanelOpen, voiceModel = 'female' }) => {
       });
       streamRef.current = stream;
       const source = audioContextRef.current.createMediaStreamSource(stream);
-      const processor = audioContextRef.current.createScriptProcessor(8192, 1, 1);
+      const processor = audioContextRef.current.createScriptProcessor(2048, 1, 1);
       processorRef.current = processor;
       source.connect(processor);
       processor.connect(audioContextRef.current.destination);
-      const silenceThreshold = 0.005;
-      const silenceChunksRequired = 2; // ~1s silence
+      const silenceThreshold = 0.003;
+      const silenceFramesRequired = 100;
+      let frameBuffer = [];
       processor.onaudioprocess = (event) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         const input = event.inputBuffer.getChannelData(0);
-        const rms = calculateRMS(input);
-        const isSilentChunk = rms < silenceThreshold;
-        if (isSilentChunk) silenceCountRef.current++;
-        else silenceCountRef.current = 0;
-        const silenceFlag = silenceCountRef.current >= silenceChunksRequired ? 0 : 1;
-        const int16PCM = floatTo16BitPCM(new Float32Array(input));
-        const pcmBase64 = btoa(String.fromCharCode.apply(null, new Uint8Array(int16PCM.buffer)));
-        const message = JSON.stringify({
-          sequence: sequenceRef.current,
-          silence: silenceFlag,
-          pcm: pcmBase64,
-        });
-        ws.send(message);
-        console.log(`[${new Date().toISOString()}] Sent chunk: sequence=${sequenceRef.current}, silence=${silenceFlag}`);
-        sequenceRef.current++; // Increment sequence number for each chunk
+        const resampledBuffer = resampleAudio(event.inputBuffer, 16000, 8000);
+        const resampledData = resampledBuffer.getChannelData(0);
+        frameBuffer.push(...resampledData);
+        const frameSize = 160;
+        while (frameBuffer.length >= frameSize) {
+          const frame = frameBuffer.slice(0, frameSize);
+          frameBuffer = frameBuffer.slice(frameSize);
+          const rms = calculateRMS(new Float32Array(frame));
+          const isSilentFrame = rms < silenceThreshold;
+          if (isSilentFrame) silenceCountRef.current++;
+          else silenceCountRef.current = 0;
+          const silenceFlag = silenceCountRef.current >= silenceFramesRequired ? 0 : 1;
+          const int16PCM = floatTo16BitPCM(new Float32Array(frame));
+          const mulawData = new Uint8Array(int16PCM.length);
+          for (let i = 0; i < int16PCM.length; i++) {
+            mulawData[i] = linearToMulaw(int16PCM[i]);
+          }
+          const mulawBase64 = btoa(String.fromCharCode.apply(null, mulawData));
+          const message = JSON.stringify({
+            client_type: "web",
+            sequence: sequenceRef.current,
+            silence: silenceFlag,
+            pcm: mulawBase64,
+          });
+          ws.send(message);
+          console.log(`[${new Date().toISOString()}] Sent MULAW chunk: sequence=${sequenceRef.current}, silence=${silenceFlag}, RMS=${rms.toFixed(4)}`);
+          sequenceRef.current++;
+        }
       };
-      console.log('Call started, streaming audio chunks');
+      console.log('Call started, streaming MULAW audio chunks at 8000 Hz');
     } catch (error) {
       console.error('Error starting call:', error);
       setMessages((prev) => [

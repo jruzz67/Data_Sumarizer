@@ -9,7 +9,6 @@ from pathlib import Path
 from vosk import Model, KaldiRecognizer
 import aiofiles
 import base64
-import subprocess
 import librosa
 
 logger = logging.getLogger(__name__)
@@ -27,17 +26,12 @@ if not os.path.exists(VOSK_MODEL_PATH):
 vosk_model = Model(VOSK_MODEL_PATH)
 logger.info("Vosk model loaded successfully")
 
-PIPER_BINARY = r"D:\Projects\OCR_with_PostgresSQL\query_sql\models\piper\piper.exe"
-PIPER_MODELS = {
-    "female": r"D:\Projects\OCR_with_PostgresSQL\query_sql\models\piper_models\en_US-amy-medium.onnx",
-    "male": r"D:\Projects\OCR_with_PostgresSQL\query_sql\models\piper_models\en_US-joe-medium.onnx"
-}
+PREDEFINED_WAV_PATH = r"D:\Projects\OCR_with_PostgresSQL\query_sql\audio\Thank you for contac.wav"
 
 def decode_base64_pcm(base64_str: str) -> np.ndarray:
     try:
         pcm_bytes = base64.b64decode(base64_str)
         pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-        # Amplify audio to improve recognition
         amplification_factor = 2.0
         pcm = pcm * amplification_factor
         pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
@@ -90,15 +84,15 @@ async def write_pcm_to_wav(pcm_data: bytes, output_path: str, sample_rate: int =
         logger.error(f"Error writing PCM to WAV: {str(e)}")
         raise
 
-async def process_audio(pcm: np.ndarray) -> str:
+async def process_audio(pcm: np.ndarray, sample_rate: int = 16000) -> str:
     try:
         start_time = time.time()
         if len(pcm) < 32000:  # ~2s at 16kHz
             logger.warning(f"PCM too short for transcription: {len(pcm)} samples")
             return ""
         wav_path = UPLOAD_DIR / f"audio_{int(time.time())}.wav"
-        await write_pcm_to_wav(pcm.tobytes(), str(wav_path))
-        recognizer = KaldiRecognizer(vosk_model, 16000, '{"beam": 20}')
+        await write_pcm_to_wav(pcm.tobytes(), str(wav_path), sample_rate)
+        recognizer = KaldiRecognizer(vosk_model, sample_rate, '{"beam": 20}')
         recognizer.SetWords(True)
         transcribed_text = ""
         async with aiofiles.open(wav_path, 'rb') as wf:
@@ -127,7 +121,6 @@ async def process_audio(pcm: np.ndarray) -> str:
                 logger.error(f"Error parsing final Vosk result: {str(e)}")
         transcribed_text = transcribed_text.strip()
         logger.info(f"Transcription completed: {transcribed_text} in {time.time() - start_time:.3f}s")
-        # Save a debug copy of the WAV file
         debug_wav = UPLOAD_DIR / f"debug_{wav_path.name}"
         shutil.copy(wav_path, debug_wav)
         logger.info(f"Saved debug WAV: {debug_wav}")
@@ -141,50 +134,21 @@ async def process_audio(pcm: np.ndarray) -> str:
             logger.info(f"Cleaned up WAV: {wav_path}")
         return ""
 
-def text_to_speech(text: str, voice_model: str = "female") -> np.ndarray:
+def text_to_speech(text: str = None, voice_model: str = "female") -> np.ndarray:
     try:
         start_time = time.time()
-        logger.info(f"Using voice model: {voice_model}")
-        model_path = PIPER_MODELS.get(voice_model, PIPER_MODELS["female"])
-        if not os.path.exists(model_path):
-            logger.error(f"Piper model not found at {model_path}")
-            raise FileNotFoundError(f"Piper model not found at {model_path}")
-        if not os.path.exists(PIPER_BINARY):
-            logger.error(f"Piper binary not found at {PIPER_BINARY}")
-            raise FileNotFoundError(f"Piper binary not found at {PIPER_BINARY}")
-        logger.info(f"Generating TTS with model: {model_path}")
-        # Create a temporary WAV file
-        temp_wav = AUDIO_DIR / f"temp_tts_{int(time.time())}.wav"
-        process = subprocess.run(
-            [PIPER_BINARY, "--model", model_path, "--output_file", str(temp_wav)],
-            input=text.encode(),
-            check=True,
-            capture_output=True
-        )
-        # Load and resample WAV using librosa
-        audio, sr = librosa.load(str(temp_wav), sr=16000, mono=True)
+        logger.info(f"Loading predefined WAV file for response")
+        if not os.path.exists(PREDEFINED_WAV_PATH):
+            logger.error(f"Predefined WAV file not found at {PREDEFINED_WAV_PATH}")
+            raise FileNotFoundError(f"Predefined WAV file not found at {PREDEFINED_WAV_PATH}")
+        audio, sr = librosa.load(PREDEFINED_WAV_PATH, sr=16000, mono=True)
         logger.info(f"Loaded WAV: sample_rate={sr}, channels=1, min={audio.min()}, max={audio.max()}")
-        # Normalize audio to [-1.0, 1.0] if necessary
         if np.max(np.abs(audio)) > 1.0:
             audio = audio / np.max(np.abs(audio))
             logger.info("Normalized audio to prevent clipping")
-        # Convert to 16-bit PCM
         pcm_data = (audio * 32767).astype(np.int16)
-        # Save PCM data to a WAV file for debugging
-        debug_pcm_wav = AUDIO_DIR / f"debug_pcm_{int(time.time())}.wav"
-        with wave.open(str(debug_pcm_wav), 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(pcm_data.tobytes())
-        logger.info(f"Saved debug PCM WAV: {debug_pcm_wav}")
-        # Clean up temporary file
-        os.remove(temp_wav)
         logger.info(f"Generated PCM data in {time.time() - start_time:.3f}s")
         return pcm_data
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Piper TTS failed: {e.stderr.decode()}")
-        raise
     except Exception as e:
-        logger.error(f"Error in text-to-speech: {str(e)}")
+        logger.error(f"Error in loading predefined WAV: {str(e)}")
         raise
